@@ -1,0 +1,13 @@
+build/
+.hunch-cache/
+__pycache__/
+*.pyc
+.amp/
+worlds/*.hpol
+*.hpol
+!policies/*.hpol
+
+# local design notes, not published
+DESIGN.md
+*.egg-info/
+dist/

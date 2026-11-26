@@ -1,0 +1,48 @@
+// Auction, delayed -- same game, but the result arrives one tick later.
+//
+// This exists to isolate one variable against worlds/auction.hunch. The rules,
+// the bids, the values and the action space are identical. The only difference
+// is that a lot is settled on the following tick instead of the one where the
+// bids were placed.
+//
+// That matters because of how learning from a scalar works. When the reward
+// lands on the same tick as the decision, the credit for it is immediate and
+// every method gets it right. When the reward is displaced by a tick, the
+// learner has to estimate what the delayed payoff was worth, and an exact
+// replay of the decision is worth more.
+//
+// Try: ./bin/hunch train worlds/auction_delayed.hunch --budget 600000
+
+world AuctionDelayed
+
+horizon 10
+
+state {
+  pending: int = 0;
+  last_va: int = 0;
+  last_vb: int = 0;
+  last_ba: int = 0;
+  last_bb: int = 0;
+}
+
+step {
+  // settle whatever was agreed last tick
+  if pending == 1 {
+    if last_ba > last_bb {
+      reward(alice, (last_va - last_ba) / 5.0);
+    }
+    if last_bb > last_ba {
+      reward(bob, (last_vb - last_bb) / 5.0);
+    }
+    pending = 0;
+  }
+
+  // then run a fresh lot, to be settled next tick
+  let va = randint(1, 5);
+  let vb = randint(1, 5);
+  last_va = va;
+  last_vb = vb;
+  last_ba = hunch alice([va / 5.0, 1.0], 6);
+  last_bb = hunch bob([vb / 5.0, 1.0], 6);
+  pending = 1;
+}

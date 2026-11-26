@@ -1,0 +1,90 @@
+// Bluffing Duel -- two agents, hidden cards, and no human data at all.
+// Try: ./bin/hunch train worlds/duel.hunch --budget 600000
+//
+// One hand: each player gets a private card, then a board card is turned up.
+// Matching the board is worth a lot. Alice acts first:
+//
+//   check  -> showdown, winner takes one chip
+//   bet 1  -> Bob either folds (Alice wins one chip) or calls (showdown, two)
+//   bet 2  -> same, but the stakes are three
+//
+// Betting a weak hand hoping Bob folds is a bluff. Learning to bluff, and to
+// catch one, is the blank that self-play fills in. Both `hunch` blanks below
+// start from noise and play each other until they are hard to exploit.
+
+world Duel
+
+horizon 4
+
+state {
+  card_a: int = 1;
+  card_b: int = 1;
+  board: int = 1;
+  phase: int = 0;
+  bet: int = 0;
+}
+
+init {
+  card_a = randint(1, 5);
+  card_b = randint(1, 5);
+  board = randint(1, 5);
+  phase = 0;
+  bet = 0;
+}
+
+fn strength(card) {
+  if card == board {
+    return card + 3;
+  }
+  return card;
+}
+
+step {
+  if phase == 0 {
+    // check, or bet one chip (small) or two (big)
+    let a = hunch alice([
+      card_a / 5.0,
+      board / 5.0,
+      1.0
+    ], [check, small, big]);
+
+    if a == 0 {
+      phase = 9;
+    } else {
+      bet = a;
+      phase = 1;
+    }
+  } else {
+    if phase == 1 {
+      let b = hunch bob([
+        card_b / 5.0,
+        board / 5.0,
+        bet / 2.0
+      ], [fold, call]);
+
+      if b == 0 {
+        reward(alice, 1.0);
+        reward(bob, -1.0);
+        done();
+      }
+      phase = 9;
+    }
+  }
+
+  if phase == 9 {
+    let stake = 1.0;
+    if bet > 0 {
+      stake = 1.0 + bet;
+    }
+
+    let sa = strength(card_a);
+    let sb = strength(card_b);
+    let res = 0.0;
+    if sa > sb { res = stake; }
+    if sa < sb { res = -stake; }
+
+    reward(alice, res);
+    reward(bob, -res);
+    done();
+  }
+}

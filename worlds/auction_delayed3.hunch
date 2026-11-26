@@ -1,0 +1,52 @@
+// Auction, delayed three ticks -- the third point on the dose-response curve.
+//
+// Identical rules to worlds/auction.hunch and worlds/auction_delayed.hunch.
+// The only difference is how far the payoff sits from the bid: a lot is
+// settled three ticks after it was agreed. Lots queue in a small ring so
+// three are always in flight.
+//
+// The point of having 0, 1 and 3 is that a single comparison can be noise,
+// but a monotone trend across three settings of one variable cannot be
+// explained by a lucky seed.
+//
+// Try: ./bin/hunch train worlds/auction_delayed3.hunch --budget 600000
+
+world AuctionDelayed3
+
+horizon 12
+
+state {
+  va: int[4];
+  vb: int[4];
+  ba: int[4];
+  bb: int[4];
+  n: int = 0;
+}
+
+step {
+  // settle the oldest lot once three are in flight
+  if n >= 3 {
+    if ba[0] > bb[0] {
+      reward(alice, (va[0] - ba[0]) / 5.0);
+    }
+    if bb[0] > ba[0] {
+      reward(bob, (vb[0] - bb[0]) / 5.0);
+    }
+    for i in 0..3 {
+      va[i] = va[i + 1];
+      vb[i] = vb[i + 1];
+      ba[i] = ba[i + 1];
+      bb[i] = bb[i + 1];
+    }
+    n = n - 1;
+  }
+
+  // then start a new lot at the back of the queue
+  let x = randint(1, 5);
+  let y = randint(1, 5);
+  va[n] = x;
+  vb[n] = y;
+  ba[n] = hunch alice([x / 5.0, 1.0], 6);
+  bb[n] = hunch bob([y / 5.0, 1.0], 6);
+  n = n + 1;
+}

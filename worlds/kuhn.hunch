@@ -1,0 +1,78 @@
+// Kuhn poker: three cards, two players, one bet. The smallest game where
+// bluffing is correct play.
+//   ./bin/hunch train worlds/kuhn.hunch      solved exactly, in milliseconds
+//   ./bin/hunch play worlds/kuhn.hunch       then try to beat it
+//
+// Each player antes one chip and is dealt one of the cards 0, 1, 2. Alice
+// passes or bets one chip. After a pass bob may pass (showdown for the antes)
+// or bet, and then alice must pass (fold) or bet (call). After a bet bob
+// passes (folds) or bets (calls). The higher card wins a showdown.
+//
+// The game is worth -1/18 to alice with best play by both.
+
+world Kuhn
+
+horizon 3
+
+state {
+  card_a: int = 0;
+  card_b: int = 0;
+  phase: int = 0;       // 0 alice opens, 1 bob faces a bet, 2 bob after a pass,
+                        // 3 alice faces a bet
+}
+
+init {
+  // Two different cards out of 0, 1, 2.
+  card_a = randint(0, 2);
+  card_b = randint(0, 1);
+  if card_b >= card_a {
+    card_b = card_b + 1;
+  }
+}
+
+step {
+  // +1 if alice holds the higher card, -1 if bob does
+  let show = -1;
+  if card_a > card_b {
+    show = 1;
+  }
+
+  // A player sees their own card and whether they are facing a bet.
+  let facing_bet = 0;
+  if phase == 1 || phase == 3 {
+    facing_bet = 1;
+  }
+
+  if phase == 0 {
+    let a = hunch alice([card_a, facing_bet], [pass, bet]);
+    if a == bet { phase = 1; } else { phase = 2; }
+  } else if phase == 1 {
+    let b = hunch bob([card_b, facing_bet], [pass, bet]);
+    if b == pass {
+      reward(alice, 1);
+      reward(bob, -1);
+    } else {
+      reward(alice, 2 * show);
+      reward(bob, -2 * show);
+    }
+    done();
+  } else if phase == 2 {
+    let b = hunch bob([card_b, facing_bet], [pass, bet]);
+    if b == pass {
+      reward(alice, show);
+      reward(bob, -show);
+      done();
+    }
+    phase = 3;
+  } else {
+    let a = hunch alice([card_a, facing_bet], [pass, bet]);
+    if a == pass {
+      reward(alice, -1);
+      reward(bob, 1);
+    } else {
+      reward(alice, 2 * show);
+      reward(bob, -2 * show);
+    }
+    done();
+  }
+}

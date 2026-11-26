@@ -1,0 +1,70 @@
+// Market maker -- quote, get filled, survive.
+// Try: ./bin/hunch train worlds/market.hunch --budget 600000
+//
+// You are the only market maker in a small market. Each tick a customer
+// arrives whose private value sits somewhere in [mid-1, mid+1]. You choose how
+// to skew your quotes. Skewing positive makes you cheap, so sellers come to
+// you and your long inventory drains; skewing negative does the opposite.
+//
+// Reward is the change in total equity (cash + inventory * mid), minus a
+// charge for the risk you are carrying.
+// Holding inventory through a volatile stretch is what hurts you, so the blank
+// `hunch train` fills in has to answer: how hard should I lean on my quotes,
+// given my position and the current volatility?
+
+world MarketMaker
+
+horizon 48
+
+state {
+  mid: float = 100.0;
+  inv: float = 0.0;
+  cash: float = 0.0;
+  vol: float = 1.0;
+}
+
+step {
+  // 0..4: skew from -0.24 (aggressively buy) to +0.24 (aggressively sell)
+  let act = hunch mm([
+    inv / 5.0,
+    (mid - 100.0) / 8.0,
+    vol,
+    step_count() / 48.0
+  ], 5);
+
+  let skew = (act - 2) * 0.12;
+  let bid = mid - 0.5 - skew;
+  let ask = mid + 0.5 - skew;
+
+  let eq0 = cash + inv * mid;
+
+  // one customer, one private value
+  let u = rand() * 2.0 - 1.0;
+  if u > 0.5 - skew {
+    // they hit our ask: we sell
+    inv = inv - 1.0;
+    cash = cash + ask;
+  } else {
+    if u < -0.5 - skew {
+      // they hit our bid: we buy
+      inv = inv + 1.0;
+      cash = cash - bid;
+    }
+  }
+
+  // volatility regimes, then the price moves
+  if rand() < 0.07 {
+    if vol < 2.0 {
+      vol = 2.2;
+    } else {
+      vol = 0.8;
+    }
+  }
+  mid = mid + (rand() - 0.5) * vol * 0.35;
+
+  let eq1 = cash + inv * mid;
+
+  // PnL, minus the cost of carrying risk. A desk that sits on a big position
+  // through a volatile stretch pays for it even when the move goes its way.
+  reward((eq1 - eq0) / 4.0 - 0.002 * inv * inv);
+}

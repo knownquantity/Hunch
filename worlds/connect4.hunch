@@ -1,0 +1,84 @@
+// Connect Four on the standard board: seven columns, six rows, nothing hidden.
+//   ./bin/hunch play worlds/connect4.hunch
+//   python3 examples/search.py                   search plays it, no training
+//
+// Players take turns dropping a disc into a column that is not full; it falls
+// to the lowest empty row. The first to line up four of their own discs in a
+// row, a column or a diagonal wins +1 and the other gets -1. A full board is
+// a draw. An action is the column, 0 to 6 from the left.
+//
+// The board has about 4.5 trillion positions: far too many to solve by
+// following every one, so `hunch train` falls back to sampling here. It is in
+// this folder to show the other way to use a world: fork it and search.
+
+world ConnectFour
+
+horizon 42
+
+state {
+  board: int[42];     // 0 empty, 1 first's disc, 2 second's; cell = row * 7 + column, row 0 at the bottom
+  height: int[7];     // discs in each column
+  open: int[7] = [1, 1, 1, 1, 1, 1, 1];
+  turn: int = 1;      // whose move: 1 first, 2 second
+  placed: int = 0;
+}
+
+// How many of `who`'s discs continue from (row, col) in direction (dr, dc),
+// not counting (row, col) itself.
+fn run(who, row, col, dr, dc) {
+  let n = 0;
+  let r = row + dr;
+  let c = col + dc;
+  let going = 1;
+  while going == 1 {
+    if r < 0 || r >= 6 || c < 0 || c >= 7 {
+      going = 0;
+    } else if board[r * 7 + c] != who {
+      going = 0;
+    } else {
+      n = n + 1;
+      r = r + dr;
+      c = c + dc;
+    }
+  }
+  return n;
+}
+
+fn wins(who, row, col) {
+  if run(who, row, col, 0, 1) + run(who, row, col, 0, -1) >= 3 { return 1; }
+  if run(who, row, col, 1, 0) + run(who, row, col, -1, 0) >= 3 { return 1; }
+  if run(who, row, col, 1, 1) + run(who, row, col, -1, -1) >= 3 { return 1; }
+  if run(who, row, col, 1, -1) + run(who, row, col, -1, 1) >= 3 { return 1; }
+  return 0;
+}
+
+step {
+  let col = 0;
+  if turn == 1 {
+    col = hunch first(board, 7, open);
+  } else {
+    col = hunch second(board, 7, open);
+  }
+
+  let row = height[col];
+  assert row < 6;
+  board[row * 7 + col] = turn;
+  height[col] = row + 1;
+  if row == 5 { open[col] = 0; }
+  placed = placed + 1;
+
+  if wins(turn, row, col) == 1 {
+    if turn == 1 {
+      reward(first, 1);
+      reward(second, -1);
+    } else {
+      reward(first, -1);
+      reward(second, 1);
+    }
+    done();
+  }
+  if placed == 42 {
+    done();
+  }
+  turn = 3 - turn;
+}

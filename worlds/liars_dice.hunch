@@ -1,0 +1,70 @@
+// Liar's dice with one six-sided die each, and the rules of OpenSpiel's
+// `liars_dice`.
+//   ./bin/hunch train worlds/liars_dice.hunch
+//
+// Bid b claims "at least q dice show face f", with b = (q - 1) * 6 + f, so
+// bids 1..6 claim one die and 7..12 claim two. A six is wild: it counts as
+// every face. Players alternate. Action 0 calls the standing bid a lie;
+// action b makes bid b, which must be higher than the standing one.
+//
+// The game is worth -7/258 to alice with best play by both.
+
+world LiarsDice
+
+horizon 13
+
+state {
+  die_a: int = 0;
+  die_b: int = 0;
+  cur: int = 0;       // the standing bid, 0 = none yet
+  mover: int = 0;     // 0 alice, 1 bob
+  hist: int = 0;      // one bit per bid made, so a player remembers the bidding
+}
+
+init {
+  die_a = randint(1, 6);
+  die_b = randint(1, 6);
+}
+
+fn bit(b) {
+  let w = 1;
+  let i = 1;
+  while i < b {
+    w = w * 2;
+    i = i + 1;
+  }
+  return w;
+}
+
+step {
+  // A call needs a bid to call, and a bid must raise.
+  let can: int[13];
+  if cur > 0 { can[0] = 1; }
+  for b in cur + 1..13 { can[b] = 1; }
+
+  let a = 0;
+  if mover == 0 {
+    a = hunch alice([die_a, hist], 13, can);
+  } else {
+    a = hunch bob([die_b, hist], 13, can);
+  }
+
+  if a > 0 {
+    cur = a;
+    hist = hist + bit(a);
+    mover = 1 - mover;
+  } else {
+    // The mover called. The bidder wins if the bid was true.
+    let q = 1 + floor((cur - 1) / 6);
+    let f = cur - (q - 1) * 6;
+    let count = 0;
+    if die_a == f || die_a == 6 { count = count + 1; }
+    if die_b == f || die_b == 6 { count = count + 1; }
+    let win = 1;                  // to alice
+    if count >= q { win = -1; }   // the caller was wrong
+    if mover == 1 { win = -win; }
+    reward(alice, win);
+    reward(bob, -win);
+    done();
+  }
+}

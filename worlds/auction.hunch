@@ -1,0 +1,41 @@
+// Auction -- two bidders, sealed bids, eight lots per episode.
+//
+// Each lot gives both bidders a private value in 1..5. Each submits one sealed
+// bid on a grid of 0..5. The higher bid wins the lot and pays its own bid, so
+// the winner's profit is value minus bid. Equal bids win nothing.
+//
+// There is no correct answer written anywhere in this file. Bidding your value
+// guarantees zero profit, bidding low wins rarely, and the useful policy is
+// somewhere in between: shade your bid, but not so much that you stop winning.
+// Two `hunch` blanks cooperate on the same tick, so this is a simultaneous-move
+// game and both sides learn against each other.
+//
+// Try: ./bin/hunch train worlds/auction.hunch --budget 600000
+
+world Auction
+
+horizon 8
+
+state {
+  // nothing needs to persist between lots
+  round: int = 0;
+}
+
+step {
+  let va = randint(1, 5);
+  let vb = randint(1, 5);
+
+  // 0..5, one bid level per action
+  let ba = hunch alice([va / 5.0, 1.0], 6);
+  let bb = hunch bob([vb / 5.0, 1.0], 6);
+
+  // the higher bid wins and pays its own price; a tie sells to nobody
+  if ba > bb {
+    reward(alice, (va - ba) / 5.0);
+  }
+  if bb > ba {
+    reward(bob, (vb - bb) / 5.0);
+  }
+
+  round = round + 1;
+}

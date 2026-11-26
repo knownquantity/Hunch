@@ -1,0 +1,100 @@
+// Leduc poker, with the rules of OpenSpiel's `leduc_poker`.
+//   ./bin/hunch train worlds/leduc.hunch     solved exactly in under a second
+//   ./bin/hunch play worlds/leduc.hunch      then play it
+//
+// Six cards numbered 0..5. A card's rank is its number halved and rounded
+// down (0 jack, 1 queen, 2 king), so there are two cards of each rank. Each
+// player antes one chip and is dealt one card face down. There are two rounds
+// of betting, and one card is turned face up between them. Alice acts first
+// in both. A raise matches the stake and adds 2 chips in the first round, 4
+// in the second, and each round allows two raises in all.
+//
+// A fold loses what the folder has put in. At the showdown a card that pairs
+// the face-up card wins, otherwise the higher rank wins, and the loser loses
+// what they put in. Equal ranks split the pot.
+//
+// There are 936 situations, 468 for each player, and the game is worth
+// -0.0856 chips a hand to alice. OpenSpiel says the same.
+
+world Leduc
+
+horizon 8             // the longest hand: check, raise, raise, call, twice
+
+state {
+  card: int[2];           // the face-down cards: card[0] alice's, card[1] bob's
+  shown: int = 6;         // the face-up card, 6 until it is dealt
+  paid: int[2] = [1, 1];  // chips each player has put in, the ante included
+  round: int = 1;
+  raises: int = 0;        // raises made in this round
+  turn: int = 0;          // whose move: 0 alice, 1 bob
+  history: int = 0;       // every action so far, see below
+}
+
+init {
+  // Bob's card is one of the five alice does not hold.
+  card[0] = randint(0, 5);
+  card[1] = randint(0, 4);
+  if card[1] >= card[0] { card[1] = card[1] + 1; }
+  assert card[0] != card[1];
+}
+
+// How good a card is at the showdown: a pair beats every rank.
+fn strength(own) {
+  if floor(own / 2) == floor(shown / 2) { return 3; }
+  return floor(own / 2);
+}
+
+// The hand is over and alice wins this many chips from bob.
+fn settle(chips) {
+  reward(alice, chips);
+  reward(bob, -chips);
+  done();
+}
+
+step {
+  let stake = max(paid[0], paid[1]);
+  let owed = stake - paid[turn];
+  assert owed == 0 || owed == 2 * round;
+
+  // A player knows their own card, the face-up card and all the betting.
+  // A fold is allowed only when chips are owed; a call is a check when none
+  // are; a raise is allowed until the round has had two.
+  let can: int[3] = [owed > 0, 1, raises < 2];
+  let action = 0;
+  if turn == 0 {
+    action = hunch alice([card[0], shown, history], [fold, call, raise], can);
+  } else {
+    action = hunch bob([card[1], shown, history], [fold, call, raise], can);
+  }
+  // One base-3 digit for each action, oldest first. No digit is ever 0,
+  // because a fold ends the hand, so no two sequences share a number.
+  history = history * 3 + action;
+
+  if action == fold {
+    // A fold loses what the folder has put in.
+    if turn == 0 { settle(-paid[0]); } else { settle(paid[1]); }
+  } else if action == raise {
+    paid[turn] = stake + 2 * round;
+    raises = raises + 1;
+    turn = 1 - turn;
+  } else if owed == 0 && turn == 0 {
+    // Alice checked to open the round, so bob still has to act.
+    turn = 1;
+  } else if round == 1 {
+    // A call that ends the first round. The face-up card is one of the four
+    // nobody holds: count past the two that are held, lower one first.
+    paid[turn] = stake;
+    shown = randint(0, 3);
+    if shown >= min(card[0], card[1]) { shown = shown + 1; }
+    if shown >= max(card[0], card[1]) { shown = shown + 1; }
+    assert shown != card[0] && shown != card[1];
+    round = 2;
+    raises = 0;
+    turn = 0;
+  } else {
+    // A call that ends the second round. Both have put in the stake by now.
+    let lead = strength(card[0]) - strength(card[1]);
+    assert stake <= 13;
+    settle(stake * clamp(lead, -1, 1));
+  }
+}

@@ -1,0 +1,49 @@
+// Rock, paper, scissors -- a pure test of whether a method learns to mix.
+//
+// Three actions, no hidden information, no delay: the reward lands on the same
+// tick as the decision. The only thing this world asks for is a genuinely
+// random policy, because there is no best action to settle on. Any collapse to
+// a single move is immediately punishable.
+//
+// PREDICTION, written before any result was produced:
+//
+//   Fork will be measurably less exploitable than PPO here. The exact value of
+//   every action at a forked state gives a direct gradient for the frequency of
+//   each action, whereas a sampled advantage only ever updates the one action
+//   that happened to be played, which is a poor signal for getting a ratio
+//   right. If fork is not less exploitable, the "mixing" explanation is wrong
+//   and the duel result stays unexplained.
+//
+// Measured as exploitability: train the agent, then play it against each of the
+// three fixed opponents. A uniform policy scores about zero against all three,
+// so the spread between the highest and lowest of those three scores is a
+// measure of how far the policy has collapsed. Lower is better.
+//
+// Try: ./bin/hunch train worlds/rps.hunch --budget 600000
+
+world RPS
+
+horizon 12
+
+state {
+  // deliberately empty: there is no state to track
+  round: int = 0;
+}
+
+step {
+  let a = hunch alice([1.0], [rock, paper, scissors]);
+  let b = hunch bob([1.0], [rock, paper, scissors]);
+
+  if a != b {
+    // a beats b when (a - 1) mod 3 == b
+    if (a + 2) % 3 == b {
+      reward(alice, 0.0833);
+      reward(bob, -0.0833);
+    } else {
+      reward(alice, -0.0833);
+      reward(bob, 0.0833);
+    }
+  }
+
+  round = round + 1;
+}

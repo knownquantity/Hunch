@@ -1,0 +1,491 @@
+# Hunch — one page, complete
+
+Hunch is a small language for reinforcement-learning environments and games.
+You write the rules of a world, say what is rewarded, and leave a `hunch(...)`
+blank wherever a decision is made. A world is one file. `hunch train` fills
+the blanks and reports what it found: what each agent collects, whether
+anything better exists, and what the policy does.
+
+    ./bin/hunch test  world.hunch      # run the rules with random play, check the asserts
+    ./bin/hunch train world.hunch      # fill the blanks; saves world.hpol beside the world
+    ./bin/hunch run   world.hunch      # one episode, step by step
+    ./bin/hunch why   world.hunch      # what every other action would have been worth
+    ./bin/hunch play  world.hunch      # take an agent's seat yourself
+
+---
+
+## File shape
+
+```
+world Name                    // optional label
+record Slot { key: int; }     // a named group of fields, before 'state' 
+horizon 50                    // optional: max steps per episode (default 100)
+param rate = 0.1;             // compile-time constant, overridable from the CLI
+
+state {
+  slots: Slot[4];             // an array of records
+  hero: Player;               // one record
+}
+                              //   (omit it when the world remembers nothing)
+init  { ... }                 // optional: runs once at the start of an episode
+step  { ... }                 // required: runs once per tick
+fn name(a, b) { ... }         // optional helpers; no recursion
+```
+
+Comments are `//` to end of line. Statements end with `;`.
+
+## Types
+
+`int` and `float` both mean a double at runtime. Arrays are fixed size:
+
+    state {
+      x: int = 0;
+      cash: float = 0.0;
+      grid: int[49];            // zero-initialised
+    }
+
+`grid = [1,1,1, 1,0,1];` in `init` fills an array from literals.
+
+## Statements
+
+    let v = expr;               // also: let v: float = expr;
+    v = expr;
+    arr[i] = expr;
+    if cond { ... } else if cond { ... } else { ... }
+    while cond { ... }
+    for i in 0..N { ... }       // i runs 0 .. N-1
+    return expr;                // inside fn only
+    reward(expr);               // single-agent world
+    reward(name, expr);         // multi-agent world, by hunch name
+    done();                     // end the episode now; the rest of the step does not run
+    assert cond;                // stop the run if a rule is violated
+
+## Local arrays
+
+`let` can declare a fixed-size array local to the step or function, which is
+how an observation gets built in a loop instead of written out:
+
+```hunch
+step {
+  let obs: float[8];
+  for i in 0..8 { obs[i] = data[i] / 10.0; }
+  let a = hunch agent(obs, 4);
+}
+```
+
+## What lasts
+
+Only `state` lasts from one step to the next. Every `let`, array or not, starts
+each step at zero and is gone at the end of its block. To remember something,
+declare it in `state`. `let c = c + 1;` is an error: the `c` on the right does
+not exist yet.
+
+## Records
+
+A record names a group of fields, and the compiler lays it out flat, so the
+whole world is still one snapshot:
+
+```hunch
+record Slot {
+  key: int;
+  last: int;
+  freq: int;
+}
+
+state {
+  slots: Slot[4];
+}
+
+step {
+  slots[i].key = want;
+  let age = step_count() - slots[i].last;
+}
+```
+
+`slots[0].freq` reads a field; `slots[0]` on its own is an error, and so is
+using a record as a value. Records hold `int`, `float`, `bool` or `num`, start
+zeroed, and cannot be nested.
+
+## Params
+
+A `param` is a number fixed when the world is compiled, so an experiment can
+sweep it without editing the file:
+
+```sh
+./bin/hunch train worlds/cache.hunch --param switch_at=45
+```
+
+Anything not overridden keeps its declared value. Overrides are part of the
+bytecode cache key, so two variants never collide.
+
+## Checking a world
+
+`./bin/hunch test worlds/x.hunch` runs a few episodes with an untrained
+policy and reports whether the rules held.
+
+`assert cond;` stops the run with the line and column when the condition is
+false. Use it to make a world prove its own rules before training on it:
+
+```hunch
+init {
+  assert SIZE > 0;
+}
+
+step {
+  assert score >= 0;
+}
+```
+
+A broken rule then fails in a second, rather than producing a training curve
+that looks plausible and means nothing.
+
+## Expressions
+
+`+ - * / %`, comparisons `== != < <= > >=`, `&& || !`, unary `-`, indexing
+`arr[i]` (out-of-range indices are clamped), parentheses.
+
+Built-ins: `rand()` in [0,1), `randint(lo, hi)` inclusive, `abs(x)`, `min(a,b)`,
+`max(a,b)`, `clamp(x,lo,hi)`, `floor(x)`, `sqrt(x)`, `exp(x)`, `step_count()`.
+
+Division by zero yields 0. Recursion is rejected at compile time.
+`step_count()` is 1 in the first step.
+
+Prefer `randint` for chance. Its outcomes can be listed, so a world that uses
+only `randint` can be followed whole and solved exactly. One `rand()` anywhere,
+or a `randint` with more than 65,536 outcomes, makes the world sample-only.
+
+## The blank
+
+    let a = hunch name([e1, e2, ...], n_actions);
+    let a = hunch name([e1, e2, ...], [left, right, wait]);
+    let a = hunch name([e1, e2, ...], [left, right, wait], legal);
+
+- `name` is the agent. **Each distinct name is its own policy with its own
+  rewards.** Two names in one file are two agents that learn against each
+  other; that is self-play, with nothing else to set up.
+- The first array is the observation: what the agent is shown. Its policy is a
+  function of these values and nothing else. It must have the **same length
+  every time** that name is used, from 1 to 64 values. A local array works too:
+  `hunch name(obs, 4)`. An agent that is shown nothing gets a constant: `[0]`.
+- The second argument is the actions: a whole-number literal from 2 to 32, or a
+  list of names. The call returns `0 .. n-1`. A name in the list is a constant
+  with the value of its position, usable anywhere in the file:
+  `if a == right { ... }`. A name stands for one number everywhere, so two
+  agents that share a name must list it at the same position, and no variable,
+  param or function may have that name. Reports and `hunch play` use the names.
+- The optional third argument says which actions are legal here: an array, or
+  a `[...]` list of expressions such as `[1, pile >= 2, pile >= 3]`, with one
+  value per action, nonzero for legal. An illegal
+  action is never returned, by any training method or by random play. At least
+  one must be legal.
+- A step may make up to 8 decisions.
+
+## What an agent knows
+
+An agent remembers nothing between decisions. If a player should know its own
+earlier moves, or the betting so far, put that in the observation: keep a
+state variable that encodes the history and pass it in (`worlds/leduc.hunch`
+and `worlds/liars_dice.hunch` do this). Leave out what the player should not
+know, such as the opponent's card.
+
+Use whole numbers for things that are whole numbers: `[card, pot]`, not
+`[card / 3.0, pot / 10.0]`. Exact solving and regret matching keep one table
+row per distinct observation, and the report prints the table under the
+expressions you wrote. Scale to roughly [-1, 1] only in worlds that will be
+trained with a neural network (`--algo ppo`), where the values are
+measurements.
+
+## Rewards
+
+Rewards are numbers you add. `reward(x)` pays the agent of a one-agent world;
+`reward(name, x)` pays a named agent, and names an agent that exists. An
+episode's return is the sum of what an agent was paid. In a two-player
+zero-sum game pay both sides: `reward(alice, w); reward(bob, -w);`.
+
+For worlds trained with a neural network keep rewards **O(1)**: a terminal
+payoff of `1.0`, a shaping hint of `0.01`, a step cost of `-0.002`. Exact
+methods do not care about scale.
+
+## A complete world
+
+```
+world Corridor
+horizon 30
+
+state {
+  x: int = 0;
+  goal: int = 8;
+}
+
+step {
+  let a = hunch walker([x, goal - x], [left, right]);
+  if a == left { x = x - 1; } else { x = x + 1; }
+  if x < 0 { x = 0; }
+  if x > 8 { x = 8; }
+
+  reward(-0.01);
+  if x == goal {
+    reward(1.0);
+    done();
+  }
+}
+```
+
+`hunch train` reports that the best any policy can collect is +0.92, eight
+steps right, and that the policy it found does so.
+
+A two-agent world with hidden information, simultaneous moves, or turns is the
+same thing with two names. `worlds/kuhn.hunch` is the shortest complete
+example: a deal in `init`, a `phase` variable for whose turn it is, and
+`reward(alice, ...)`, `reward(bob, ...)`, `done()` at the end of a hand.
+
+## Designing a good world
+
+1. **Say what you want, not how.** Reward the outcome; let the blank find the route.
+2. **Everything the policy can act on must be in the observation.** A policy is a
+   function of the array you pass, nothing else. Hidden state it cannot see is
+   noise it cannot learn around.
+3. **Make comparisons easy where you can.** Absolute values tell a policy how
+   stale something is; values measured against the average tell it whether it is
+   the coldest one. The second is usually the decision it actually has to make.
+4. **Give the agent a signal it can find.** A payoff that requires twenty
+   correct moves before it appears for the first time is invisible. Intermediate
+   rewards, one-time hints, and small exploration bonuses are legitimate world
+   design. This is for worlds trained by sampling; a world small enough to be
+   followed whole needs no hints.
+5. **Check that it is solvable.** Run a hand-scripted path:
+   `./bin/hunch run w.hunch --agent hero --actions up,up,left --policy none`
+6. **Make the world check itself.** `assert` what must always hold (chips are
+   conserved, a square is taken once), then run `hunch test`.
+7. **Mask illegal moves, do not punish them.** Pass a legal array instead of
+   paying a penalty for a move that is not allowed.
+8. **End the game.** Call `done()` when the episode is over, and set `horizon`
+   to the longest episode the rules allow.
+
+## What `train` does
+
+With `--algo auto`, the default, `train` first tries to follow the world
+whole: every chance outcome of `randint` and every action, merging positions
+that share a state. That works up to 2,000,000 positions (`--exact-nodes`) and
+without `rand()`. Then:
+
+- **No agent would choose differently if it saw the whole state** (a board
+  game, or any world with one agent or two zero-sum agents where what an agent
+  is shown is enough to choose by): backward induction. The value of the game
+  and a policy that attains it, exactly.
+- **One agent**: a search over every outcome. The report says "this one is
+  optimal" when that is proven, and otherwise gives the best found and what an
+  agent that saw the whole state could collect.
+- **Several agents**: regret matching (CFR+) until no agent can gain more than
+  `--target` (default 0.001) by changing alone, or `--max-sec` (default 60).
+  The first line says "stopped short of its target" if time ran out first.
+
+A policy found on the whole world also covers situations that good play never
+reaches, so it does not fall apart against a person or a random opponent.
+
+When the world cannot be followed whole:
+
+- **One agent**: `ppo`, a 32x32 network, `--budget` environment steps
+  (default 200,000).
+- **Several agents**: regret matching on sampled episodes (default 2,000,000
+  steps). It needs observations that repeat.
+
+Other values of `--algo`: `regret`, `ppo`, `fork` (PPO plus a replay of
+selected decisions once per action under the same random numbers),
+`reinforce`, `random`.
+
+## Reading the report
+
+    alice  collects -0.0556 per episode
+    the most each agent could gain by changing its policy alone: alice 0.0004, bob 0.0003   (NashConv 0.0007)
+
+- "scored exactly" means every outcome was weighed; nothing was sampled.
+  Otherwise the numbers carry a standard error and the first line says why.
+- NashConv is the sum of what each agent could gain by switching to its best
+  reply. Zero is an equilibrium. In a two-player zero-sum game the value the
+  first agent collects is then the value of the game.
+- "with everyone playing at random" is the world's baseline. "against
+  opponents playing at random" is each agent's policy against uniform play by
+  the others.
+- "the search is not a proof" (several agents) or "that is a search, not a
+  proof" (one agent) appears when an agent is shown the same thing after
+  different histories and that matters: no better reply was found, but one is
+  not ruled out. Putting what the agent should remember into its observation
+  removes it.
+- "positions" counts every point where something is decided or drawn, after
+  merging the ones with equal state at the start of the same step.
+- The table lists the situations an agent meets most and what it does in each.
+  `-` marks an illegal action. `--rows N` lists more.
+
+`hunch why` prints two numbers per alternative action. "this episode" replays
+that exact instant, with hidden things as they were, as the mean of `--samples`
+continuations (default 200) with one standard error. "whenever shown this" is
+the exact value over every instant in which the agent is shown the same thing,
+which is the fair test of a policy that cannot see what is hidden; it is
+printed when the world can be followed whole.
+
+## From Python
+
+`pip install git+https://github.com/knownquantity/Hunch`, or put a checkout on
+`sys.path`. The core needs only the standard library and a C compiler; numpy,
+gymnasium and pettingzoo are imported only by the calls that use them. An
+installed Hunch builds its runtime into `~/.cache/hunch` on first use (set
+`HUNCH_HOME` to put it elsewhere). The worlds from the repository ship with it:
+`hunch.examples()` lists their names, `hunch.example("kuhn")` opens one, and
+the commands take a name in place of a file (`hunch train kuhn`).
+
+    import hunch
+    world  = hunch.World("kuhn.hunch", params={"stake": 2})   # params is optional
+    solved = world.train()                   # print(solved) is the train report
+    solved.value                             # {"alice": -0.0556, "bob": 0.0556}
+    solved.nashconv                          # what the agents could gain between them; None if sampled
+    solved.proven                            # True when that figure is a proof, not a search
+    solved.path                              # the .hpol it was saved to
+    solved.probs("alice", [1, 0])            # one probability per action
+    saved = hunch.Policy(world, "kuhn.hpol") # a policy file from an earlier run
+
+`world.train(out=PATH, target=G, max_sec=S, seed=N, algo=A, budget=N)` takes
+what `hunch train` takes. Wherever a policy is wanted (`policy=`, `against=`),
+a `Policy` or the path of a `.hpol` works.
+
+    env = world.env(agents=["alice"], policy=solved)   # you decide alice; the rest play
+    env.reset(seed=1)                                  # `policy`, or at random without one
+    while not env.over:
+        env.agent, env.obs, env.legal        # whose turn, what it is shown, legal action numbers
+        env.act("bet")                       # a name or a number; returns {agent: paid}
+    env.returns                              # {agent: total}; env.state is the world's `state`
+
+- `world.agents`, `world.actions[agent]` (names), `world.sees[agent]` (the
+  source text of each observation value), `world.rules`, and
+  `world.prompt(agent, obs, legal)` (a question for a language model).
+- `world.rules` is the `//` comment lines at the very top of the file, before
+  `world`. Write the game there in words a player could follow; lines that show
+  a `hunch` command are left out of it.
+- `world.env()` with no `agents` lets you decide every agent, each on its turn.
+- `env.reset(seed)` plays the episode `hunch run --seed` plays. `env.reset()`
+  takes the seed after the last one, starting at 0.
+- `env.obs` is a list of floats and `env.legal` a list of action numbers.
+- An illegal action or a failed `assert` raises `hunch.HunchRuntimeError`, and
+  the environment is still waiting at the same decision. A name the agent does
+  not have, or a number out of range, raises `ValueError`.
+- `env.terminated` is an episode ended by `done()`, `env.truncated` one that
+  ran to the horizon.
+
+Forking: `snap = env.snapshot()` is the instant, random numbers included.
+`env.restore(snap)` returns to it, in this Env or another of the same world.
+Act differently afterwards for a fork. Restore alone replays the same future;
+call `env.reseed(n)` after it to draw everything still to come from a new
+stream. `env.playout()` finishes the episode with uniform random play in C and
+returns what each agent was paid. `env.memory()` is a hashable key: two
+instants with the same key are the same position.
+
+Many at once: `envs = world.vec(n, agent="alice", policy=solved)`, then
+`obs, legal = envs.reset(seed)` and `obs, reward, over, legal = envs.step(actions)`
+with numpy arrays: obs (n, width) float64, legal (n, actions) bool, actions (n,)
+int32, over 0 running / 1 done / 2 horizon. A row whose episode ended already
+holds the next episode's first decision, so `reset` is called once. Without
+`agent` you decide everyone; `envs.agent` says whose turn each row is and
+reward is (n, agents). The arrays returned are new each call. If one row's
+action is illegal, the error is raised and no row is stepped. If the world
+itself fails in a row (an `assert`), the batch stops: call `reset` again.
+
+Other libraries: `world.gym(agent, policy)` is a `gymnasium.Env` (float32 Box,
+Discrete, `info["action_mask"]`, `action_masks()`); `world.pettingzoo()` is an
+AEC environment with the mask in `infos`.
+
+### Grading an agent that is not a policy file
+
+    grade = world.grade({"alice": f}, against=solved)    # print(grade) is the report
+    grade.collects, grade.reference, grade.best_reply, grade.gives_away("alice"), grade.mistakes
+
+`f(obs, legal)` is called with what the agent is shown (a list of floats) and
+the legal action numbers. It returns an action (number or name) or
+probabilities (a list with one per action, or a dict by name; they are scaled
+to sum to 1). When the world can be followed whole, `f` is called once for each
+thing its agent can be shown and the grade is exact for that `f` and that
+`against`:
+
+- `collects`: what each agent collects, `f` in its seat and `against` in the
+  others.
+- `best_reply[agent]`: the most that agent could collect against everyone
+  else. For the graded agent this is what it fell short of; for its opponent
+  it is how hard the graded agent can be punished.
+- `gives_away(agent)`, two agents whose rewards sum to zero: the opponent's
+  best reply less what the opponent collects in the reference. It is the
+  agent's exploitability to within `grade.reference_gap`, the reference's own
+  NashConv. Grade against a trained policy, and train with a smaller target
+  (`world.train(target=1e-6)`) for a sharper yardstick; against random play
+  the report leaves the figure out.
+- `mistakes`: each decision where another action was worth more, worst first,
+  with `obs`, `probs`, `best`, `value` (what each action goes on to collect)
+  and `cost` per episode. A cost smaller than `reference_gap` is noise from an
+  approximate reference. Where an episode can come to the same observation
+  more than once, a cost is for changing one visit and leaving the others.
+
+Otherwise `episodes` episodes are played and `grade.exact` is False. `f` must
+answer from `obs` alone for the exact grade to describe it.
+
+For an agent in another process or a language model:
+
+    hunch grade world.hunch --agent alice --cmd 'python3 agent.py'
+    hunch grade world.hunch --agent alice --questions > q.jsonl
+    hunch grade world.hunch --agent alice --answers a.jsonl
+
+`--cmd` starts the program once and writes one JSON question per line to its
+stdin: `{"agent", "obs", "sees", "legal", "prompt"}`, where `sees` maps each
+observation's source text to its value and `legal` holds action names. The
+program must print one line for each question as it reads it and flush its
+output, because the next question is sent only after the answer arrives;
+`--timeout` (default 120 s) bounds the wait. The smallest such program:
+
+    import json, sys
+    for line in sys.stdin:
+        q = json.loads(line)
+        print(q["legal"][0], flush=True)
+
+`--questions` lists every decision the agent can face, each with an `id`.
+`--answers` reads one answer per line: either all in question order, or all as
+`{"id": 3, "answer": ...}` in any order. Every question needs exactly one
+answer; a blank line, a missing, extra or repeated answer is an error that
+names the line or question.
+
+An answer is an action name or number, JSON probabilities by name
+(`{"pass": 0.7, "bet": 0.3}`), or a plain sentence that names exactly one
+action ("I would bet here."). A sentence that names two actions, an illegal
+one, or contains a negation ("I will not bet") is refused, not guessed at. Each
+prompt ends by asking for one action name or JSON probabilities.
+
+In Python: `world.questions(agent)`, `world.grade_answers(answers, agent,
+against)` and `world.program(agent, command)`. On the command line the other
+agents play the `.hpol` beside the world, as in `run`.
+
+### Search
+
+    search = hunch.Search(world, playouts=1000)
+    env.act(search.choose(env))              # env is left unchanged by choose
+
+Monte Carlo tree search over forks, for a world too big to follow whole. It
+reads the whole state, so use it only where the agents are shown everything.
+`search.tried` holds `{action: (tries, mean value)}` from the last call.
+
+## CLI
+
+    hunch check <file>                 compile; print what each agent sees and its actions
+    hunch test <file> [--episodes N]   random play; which asserts ran, clamped indices, zero divisors;
+                                       a failed assert names its line, step and seed
+    hunch train <file> [--algo A] [--budget N] [--seed N] [--out p.hpol]
+                       [--target G] [--max-sec S] [--exact-nodes N] [--json]
+    hunch score <file> [--policy p]    the report for a saved policy, without training
+    hunch run <file> [--seed N] [--episodes N] [--json]
+    hunch run <file> --agent hero --actions up,up,left   script one agent, by name or number;
+                                       when the list runs out the policy takes over
+    hunch why <file> [--seed N] [--step K] [--samples N]
+    hunch play <file> [--as AGENT] [--seed N]
+    hunch grade <file> [--agent A] (--cmd PROGRAM | --questions | --answers FILE)
+                       [--policy p] [--timeout S] [--json]
+    hunch bench <file> [--algos random,ppo,fork] [--seeds 1,2,3] [--budget N]
+    hunch studio [--port 8000]
+
+`run`, `why`, `play` and `score` use the `.hpol` that `train` left beside the
+world. `--policy FILE` names another, and `--policy none` means random play.
+`--param name=value` overrides a `param` in any command that takes a file.

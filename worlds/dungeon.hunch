@@ -1,0 +1,119 @@
+// Dungeon -- find the key, dodge the trap, open the exit.
+// Try: ./bin/hunch train worlds/dungeon.hunch --budget 400000 --entropy 0.02
+//
+// No pathfinding code lives in this file. The hero's four moves are an open
+// `hunch(...)` blank; the rewards say what matters:
+//
+//   new tile    +0.005  a little curiosity, so the hero explores
+//   bait        +0.030  a cheap win tucked in a dead end -- a decoy
+//   key         +0.100  and now the exit unlocks
+//   trap        -0.200  and the run ends
+//   exit        +1.000  but only with the key
+//   locked door +0.050  the first time, so the hero learns where it is
+//   every step  -0.002
+//
+// The hero sees the walls around it and roughly which way its objective lies,
+// like a person who can see the key across the room. Working out the route is
+// the blank that `hunch train` fills in.
+
+world Dungeon
+
+horizon 50
+
+state {
+  x: int = 1;
+  y: int = 1;
+  has_key: int = 0;
+  tried_door: int = 0;
+  seen: int[49];
+  tile: int[49];
+}
+
+init {
+  // 0 floor | 1 wall | 2 trap | 3 key | 4 exit | 5 bait
+  tile = [
+    1,1,1,1,1,1,1,
+    1,0,0,0,0,3,1,
+    1,0,1,1,1,0,1,
+    1,0,0,2,0,0,1,
+    1,1,1,1,1,0,1,
+    1,5,0,0,0,4,1,
+    1,1,1,1,1,1,1
+  ];
+}
+
+// What is on a tile? (outside the map counts as wall)
+fn at(xx, yy) {
+  if xx < 0 { return 1; }
+  if xx > 6 { return 1; }
+  if yy < 0 { return 1; }
+  if yy > 6 { return 1; }
+  return tile[yy * 7 + xx];
+}
+
+step {
+  // head for the key first, then the exit
+  let tx = 5;
+  let ty = 1;
+  if has_key == 1 {
+    tx = 5;
+    ty = 5;
+  }
+
+  let a = hunch hero([
+    (tx - x) / 6.0,
+    (ty - y) / 6.0,
+    has_key,
+    at(x, y - 1) / 4.0,
+    at(x, y + 1) / 4.0,
+    at(x - 1, y) / 4.0,
+    at(x + 1, y) / 4.0,
+    step_count() / 50.0
+  ], [up, down, left, right]);
+
+  let nx = x;
+  let ny = y;
+  if a == 0 { ny = y - 1; }
+  if a == 1 { ny = y + 1; }
+  if a == 2 { nx = x - 1; }
+  if a == 3 { nx = x + 1; }
+
+  if at(nx, ny) != 1 {
+    x = nx;
+    y = ny;
+  }
+
+  let idx = y * 7 + x;
+  if seen[idx] == 0 {
+    seen[idx] = 1;
+    reward(0.005);
+  }
+
+  let here = tile[idx];
+
+  if here == 2 {
+    reward(-0.20);
+    done();
+  }
+  if here == 3 {
+    has_key = 1;
+    reward(0.10);
+    tile[idx] = 0;
+  }
+  if here == 5 {
+    reward(0.03);
+    tile[idx] = 0;
+  }
+  if here == 4 {
+    if has_key == 1 {
+      reward(1.00);
+      done();
+    }
+    if tried_door == 0 {
+      tried_door = 1;
+      reward(0.05);
+    }
+  }
+
+  reward(-0.002);
+}

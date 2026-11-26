@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Hunch Studio</title>
+<link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+<div class="app">
+
+  <aside class="rail">
+    <div class="brand">
+      <div class="mark"></div>
+      <div>
+        <div class="name">Hunch</div>
+        <div class="tag">leave the decision blank</div>
+      </div>
+    </div>
+
+    <nav id="worlds"></nav>
+
+    <div class="rail-foot">
+      <a href="/llms.txt" target="_blank" rel="noopener">1-page cheat sheet</a>
+      <div class="hint">Write the rules, score what matters, leave a <code>hunch(...)</code> blank. The language learns the blank from experience.</div>
+    </div>
+  </aside>
+
+  <main>
+    <header class="head">
+      <div>
+        <h1 id="title">Loading</h1>
+        <p id="blurb"></p>
+      </div>
+      <div class="badge" id="seedBadge"></div>
+    </header>
+
+    <section class="theater">
+      <div class="pane">
+        <div class="pane-head">
+          <span class="dot untrained"></span>
+          <span id="labelA">Round 1</span>
+          <span class="sub" id="retA"></span>
+        </div>
+        <div class="stage"><canvas id="cvA"></canvas></div>
+      </div>
+      <div class="pane">
+        <div class="pane-head">
+          <span class="dot trained"></span>
+          <span id="labelB">Trained</span>
+          <span class="sub" id="retB"></span>
+        </div>
+        <div class="stage"><canvas id="cvB"></canvas></div>
+      </div>
+    </section>
+
+    <div class="transport">
+      <button id="playBtn" class="primary">Play</button>
+      <button id="stepBtn">Step</button>
+      <button id="resetBtn">Reset</button>
+      <input id="speed" type="range" min="1" max="30" value="12" />
+      <span id="tick" class="tick">0 / 0</span>
+      <span class="spacer"></span>
+      <span class="legend" id="legend"></span>
+    </div>
+
+    <section class="cols">
+      <div class="card">
+        <h2>Rewind moments</h2>
+        <p class="lede">Every time the trained policy reached a decision it had to make exactly, the runtime replayed
+          that same instant once per possible action. These are the forks with the widest spread.</p>
+        <div id="rewind" class="rewind"></div>
+      </div>
+
+      <div class="card">
+        <h2>Learning curve</h2>
+        <p class="lede" id="curveLede">Return at equal simulation budgets.</p>
+        <div class="chartwrap"><canvas id="curve"></canvas></div>
+        <div id="benchTable" class="bench"></div>
+      </div>
+    </section>
+
+    <section class="card codecard">
+      <div class="codehead">
+        <h2>The whole world</h2>
+        <div class="spacer"></div>
+        <select id="algo">
+          <option value="fork">hunch fork</option>
+          <option value="ppo">PPO baseline</option>
+          <option value="reinforce">REINFORCE baseline</option>
+          <option value="random">random</option>
+        </select>
+        <select id="liveBudget">
+          <option value="60000">quick (60k steps)</option>
+          <option value="250000" selected>normal (250k steps)</option>
+          <option value="1000000">deep (1M steps)</option>
+        </select>
+        <button id="trainBtn" class="primary">Train live</button>
+      </div>
+      <pre id="source" class="source"></pre>
+      <div id="trainOut" class="trainout"></div>
+    </section>
+
+    <div class="hint" id="lesson"></div>
+  </main>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

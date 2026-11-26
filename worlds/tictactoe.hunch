@@ -1,0 +1,59 @@
+// Tic-tac-toe: two players, nothing hidden.
+//   ./bin/hunch train worlds/tictactoe.hunch     a draw with best play
+//   ./bin/hunch play worlds/tictactoe.hunch      it cannot be beaten
+//
+// Both players see the whole board, and the third argument of each `hunch`
+// says which squares are still empty. An action is the square to take,
+// numbered 0 to 8 along the rows.
+
+world TicTacToe
+
+horizon 9
+
+state {
+  board: int[9];      // 0 empty, 1 x, 2 o
+  free: int[9] = [1, 1, 1, 1, 1, 1, 1, 1, 1];
+  turn: int = 1;      // whose move: 1 x, 2 o
+  placed: int = 0;
+}
+
+fn line(a, b, c) {
+  if board[a] != 0 && board[a] == board[b] && board[b] == board[c] {
+    return 1;
+  }
+  return 0;
+}
+
+fn won() {
+  return line(0, 1, 2) + line(3, 4, 5) + line(6, 7, 8)
+       + line(0, 3, 6) + line(1, 4, 7) + line(2, 5, 8)
+       + line(0, 4, 8) + line(2, 4, 6);
+}
+
+step {
+  let move = 0;
+  if turn == 1 {
+    move = hunch x(board, 9, free);
+  } else {
+    move = hunch o(board, 9, free);
+  }
+
+  board[move] = turn;
+  free[move] = 0;
+  placed = placed + 1;
+
+  if won() > 0 {
+    if turn == 1 {
+      reward(x, 1);
+      reward(o, -1);
+    } else {
+      reward(x, -1);
+      reward(o, 1);
+    }
+    done();
+  }
+  if placed == 9 {
+    done();
+  }
+  turn = 3 - turn;
+}

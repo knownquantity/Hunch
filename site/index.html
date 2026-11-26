@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hunch</title>
+<meta name="description" content="Zero-dependency language for forkable RL environments">
+<link rel="icon" href="favicon.ico?v=3" sizes="16x16 32x32 48x48" type="image/x-icon">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/icon-32.png">
+<link rel="apple-touch-icon" href="assets/icon-180.png">
+<link rel="alternate" type="text/plain" href="llms.txt" title="Hunch — one page, complete">
+
+<meta property="og:site_name" content="Hunch">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Hunch">
+<meta property="og:description" content="Zero-dependency language for forkable RL environments">
+<!-- og:image should become absolute once the site has a domain -->
+<meta property="og:image" content="assets/hunch-card-1200x630.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Hunch">
+<meta name="twitter:description" content="Zero-dependency language for forkable RL environments">
+<meta name="twitter:image" content="assets/hunch-card-1200x630.png">
+<meta name="color-scheme" content="light">
+<style>
+  @font-face {
+    font-family: "Instrument Sans";
+    src: url("assets/fonts/instrument-sans.woff2") format("woff2");
+    font-weight: 400 700;
+    font-display: swap;
+  }
+  @font-face {
+    font-family: "IBM Plex Mono";
+    src: url("assets/fonts/plex-mono-400.woff2") format("woff2");
+    font-weight: 400;
+    font-display: swap;
+  }
+
+  :root {
+    --ink: #000;
+    --muted: #6b6b6b;
+    --panel: #f7f7f5;
+    --sans: "Instrument Sans", ui-sans-serif, system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+
+  body {
+    margin: 0;
+    background: #fff;
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.5;
+  }
+
+  ::selection { background: #ded3f7; }
+
+  code, pre { font-family: var(--mono); }
+
+  /* ---------- page ---------- */
+
+  main {
+    display: flex;
+    flex-direction: column;
+    min-height: 100dvh;
+    padding: 40px;
+  }
+
+  .hero {
+    display: flex;
+    align-items: stretch;
+    gap: clamp(32px, 4vw, 64px);
+  }
+
+  /* ---------- the card ---------- */
+
+  .art {
+    position: relative;
+    flex: none;
+    width: min(315px, 100%);
+    line-height: 0;
+  }
+  .art img { display: block; width: 100%; height: auto; }
+
+  .overlay {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    grid-template-columns: repeat(9, 1fr);
+    grid-template-rows: repeat(5, 1fr);
+  }
+
+  .hit {
+    cursor: pointer;
+    background: transparent;
+    transition: background 160ms ease;
+  }
+
+  .overlay[data-focus] .hit { background: rgba(255, 255, 255, 0.74); }
+  .overlay[data-focus] .hit.on { background: transparent; }
+
+  /* ---------- the copy ---------- */
+
+  .copy {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    container-type: inline-size;
+  }
+
+  .sentence {
+    margin: 0;
+    font-size: 28px;
+    font-size: clamp(22px, 4.3cqw, 56px);
+    line-height: 1.22;
+    letter-spacing: -0.01em;
+    font-weight: 400;
+    text-wrap: balance;
+  }
+  .sentence strong { font-weight: 600; }
+
+  .sentence .nw { white-space: nowrap; }
+
+  .panel {
+    max-width: 620px;
+    margin-top: 40px;
+    padding-top: 0;
+    min-height: 230px;
+  }
+
+  .label {
+    margin: 0 0 8px;
+    font: 500 14px/1 var(--sans);
+    color: var(--muted);
+  }
+
+  .desc { margin: 0 0 14px; font-size: 15px; max-width: 46ch; }
+
+  .codebox {
+    margin: 0;
+    max-width: 100%;
+    padding: 12px 14px;
+    background: var(--panel);
+    border: 1px solid #000;
+    border-radius: 2px;
+    font: 400 11.5px/1.75 var(--mono);
+    color: #1a1b1e;
+  }
+
+  .cmd {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 14px;
+    gap: 10px;
+    align-items: start;
+  }
+
+  .cmd code {
+    font: inherit;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .copy-btn {
+    appearance: none;
+    border: 0;
+    background: none;
+    padding: 2px 0 0;
+    color: var(--muted);
+    opacity: 0;
+    cursor: pointer;
+    line-height: 1;
+    transition: opacity 120ms ease;
+  }
+  .cmd:hover .copy-btn,
+  .copy-btn:focus-visible { opacity: 1; }
+  .copy-btn:hover { color: var(--ink); }
+  .copy-btn.ok { opacity: 1; color: var(--ink); }
+
+  /* ---------- keyboard / links ---------- */
+  .hit { display: block; }
+  .hit:focus-visible {
+    outline: 2px solid #000;
+    outline-offset: -2px;
+    position: relative;
+    z-index: 2;
+  }
+
+  .links {
+    display: flex;
+    gap: 26px;
+    align-self: flex-start;
+    margin-top: 18px;
+  }
+
+  .repo {
+    display: inline-block;
+    font: 400 12px/1 var(--mono);
+    color: var(--ink);
+    text-decoration: none;
+    border-bottom: 1px solid var(--ink);
+    padding-bottom: 3px;
+  }
+  .repo:hover { opacity: 0.6; }
+
+  /* ---------- the fall ---------- */
+
+  .drop-layer {
+    position: fixed;
+    inset: 0;
+    overflow: hidden;
+    pointer-events: none;
+    z-index: 60;
+  }
+
+  .falling {
+    position: fixed;
+    border-radius: 2px;
+    will-change: transform;
+    animation-name: fall;
+    animation-timing-function: cubic-bezier(0.4, 0, 1, 1);
+    animation-fill-mode: forwards;
+  }
+
+  @keyframes fall {
+    to { transform: translate(var(--dx), 110vh) rotate(var(--rot)); }
+  }
+
+  @media (max-width: 900px) {
+    main { padding: 24px 24px 64px; }
+    .hero {
+      flex-direction: column;
+      gap: 24px;
+    }
+    .panel { margin-top: 28px; min-height: 0; }
+  }
+</style>
+</head>
+<body>
+
+<main>
+  <div class="hero">
+  <div class="art">
+    <img src="assets/hunch-card.png?v=2"
+         alt="Hunch — a riso-printed grid of cyan, purple and yellow cells forming an H">
+    <div class="overlay" id="overlay" role="navigation" aria-label="Hunch sections"></div>
+  </div>
+
+    <div class="copy">
+      <p class="sentence"><strong>Hunch</strong> is a compiled, <span class="nw">self-play-native</span> programming language for forkable RL environments.</p></div>
+  </div>
+
+  <div class="panel" id="panel">
+      <p class="label" id="label">Quickstart</p>
+      <p class="desc" id="desc">Clone, check a world, train it, then open the studio. Needs python3 and a C compiler.</p>
+    <pre class="codebox" id="code">$ git clone github.com/knownquantity/Hunch
+$ ./bin/hunch check worlds/dungeon.hunch
+$ ./bin/hunch train worlds/dungeon.hunch --algo fork --budget 400000
+$ ./bin/hunch studio</pre>
+  </div>
+
+  <div class="links">
+    <a class="repo" href="llms.txt">One-page reference (llms.txt)</a>
+    <a class="repo" href="https://github.com/knownquantity/Hunch">GitHub ↗</a>
+  </div>
+</main>
+
+<script>
+  const PATTERN = [
+    "ccppppccp",
+    "ypycccppc",
+    "yyycccppc",
+    "ypyppcppc",
+    "pcpcpcpcp"
+  ];
+  const REGION = { y: 'home', p: 'docs', c: 'studio' };
+
+  const COPY = {
+    home: {
+      label: 'Quickstart',
+      desc: 'Clone, check a world, train it, then open the studio. Needs python3 and a C compiler.',
+      code: '$ git clone github.com/knownquantity/Hunch\n$ ./bin/hunch check worlds/dungeon.hunch\n$ ./bin/hunch train worlds/dungeon.hunch --algo fork --budget 400000\n$ ./bin/hunch studio'
+    },
+    docs: {
+      label: 'Docs',
+      desc: 'The whole language on one page: state, step, reward, and the hunch blank. Generated from the same source as the cheat sheet.',
+      code: 'world Dungeon\nstate { x: int = 1; y: int = 1; }\nstep {\n  let a = hunch hero([x / 6.0, y / 6.0], 4);\n}'
+    },
+    studio: {
+      label: 'Studio',
+      desc: 'Replay the four trained worlds, step the policy, and fork a decision to see what the other actions were worth.',
+      code: '$ ./bin/hunch studio'
+    }
+  };
+
+  const overlay = document.getElementById('overlay');
+  const label = document.getElementById('label');
+  const desc = document.getElementById('desc');
+  const code = document.getElementById('code');
+
+  const LABEL = { home: 'Home', docs: 'Documentation', studio: 'Studio' };
+  const ORDER = { home: 0, docs: 1, studio: 2 };
+  const seen = new Set();
+
+  // DOM order sets the tab order (Home, Docs, Studio); grid placement keeps the art intact
+  const cells = [];
+  PATTERN.forEach((row, r) => [...row].forEach((ch, c) => cells.push({ ch, r, c })));
+  cells.sort((a, b) =>
+    ORDER[REGION[a.ch]] - ORDER[REGION[b.ch]] || a.r - b.r || a.c - b.c);
+
+  cells.forEach(({ ch, r, c }) => {
+    const region = REGION[ch];
+    const hit = document.createElement('a');
+    hit.className = 'hit ' + ch;
+    hit.dataset.region = region;
+    hit.href = '#' + region;
+    hit.style.gridRow = r + 1;
+    hit.style.gridColumn = c + 1;
+    if (!seen.has(region)) {
+      hit.setAttribute('aria-label', LABEL[region]);
+      seen.add(region);
+    } else {
+      hit.tabIndex = -1;
+      hit.setAttribute('aria-hidden', 'true');
+    }
+    overlay.appendChild(hit);
+  });
+
+  let pinned = null;
+
+  const COPY_ICON = '<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>';
+  const CHECK_ICON = '<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true"><path d="M4 12.5l5 5L20 6"/></svg>';
+
+  function renderCode(text) {
+    code.innerHTML = '';
+    text.split('\n').forEach(line => {
+      const row = document.createElement('div');
+      row.className = 'cmd';
+      const c = document.createElement('code');
+      c.textContent = line || ' ';
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'copy-btn';
+      b.setAttribute('aria-label', 'Copy line');
+      b.innerHTML = COPY_ICON;
+      b.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(line);
+        } catch {
+          const t = document.createElement('textarea');
+          t.value = line;
+          document.body.appendChild(t);
+          t.select();
+          document.execCommand('copy');
+          t.remove();
+        }
+        b.innerHTML = CHECK_ICON;
+        b.classList.add('ok');
+        setTimeout(() => { b.innerHTML = COPY_ICON; b.classList.remove('ok'); }, 1200);
+      });
+      row.append(c, b);
+      code.appendChild(row);
+    });
+  }
+
+  function show(region) {
+    const info = COPY[region] || COPY.home;
+    if (region) overlay.dataset.focus = region;
+    else overlay.removeAttribute('data-focus');
+    overlay.querySelectorAll('.hit').forEach(h =>
+      h.classList.toggle('on', h.dataset.region === region));
+    label.textContent = info.label;
+    desc.textContent = info.desc;
+    renderCode(info.code);
+  }
+
+  renderCode(code.textContent);
+
+  function select(region, updateUrl) {
+    pinned = region;
+    show(region);
+    if (updateUrl) {
+      // mock routing; swap for /docs/ and /studio/ when those pages exist
+      history.replaceState(null, '', region ? '#' + region : location.pathname);
+    }
+  }
+
+  // restore a selection from the URL
+  const fromHash = location.hash.replace('#', '');
+  if (COPY[fromHash]) select(fromHash, false);
+
+  overlay.addEventListener('mouseover', e => {
+    if (pinned) return;
+    const hit = e.target.closest('.hit');
+    if (hit) show(hit.dataset.region);
+  });
+
+  overlay.addEventListener('mouseleave', () => {
+    if (!pinned) show(null);
+  });
+
+  /* ---------- the fall ---------- */
+
+  const dropLayer = document.createElement('div');
+  dropLayer.className = 'drop-layer';
+  document.body.appendChild(dropLayer);
+
+  const cardImg = document.querySelector('.art img');
+  const played = new Set();
+  const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  function dropRegion(region) {
+    if (played.has(region)) return;
+    played.add(region);
+    if (reduceMotion) return;
+
+    const view = cardImg.getBoundingClientRect();
+    const cells = [...overlay.querySelectorAll('.hit')]
+      .filter(h => h.dataset.region === region);
+
+    cells.forEach(hit => {
+      const r = hit.getBoundingClientRect();
+      const piece = document.createElement('div');
+      piece.className = 'falling';
+      piece.style.left = r.left + 'px';
+      piece.style.top = r.top + 'px';
+      piece.style.width = r.width + 'px';
+      piece.style.height = r.height + 'px';
+      piece.style.backgroundImage = 'url("assets/hunch-card.png?v=2")';
+      piece.style.backgroundSize = view.width + 'px ' + view.height + 'px';
+      piece.style.backgroundPosition =
+        -(r.left - view.left) + 'px ' + -(r.top - view.top) + 'px';
+      piece.style.setProperty('--dx', (Math.random() * 90 - 45).toFixed(1) + 'px');
+      piece.style.setProperty('--rot', (Math.random() * 30 - 15).toFixed(1) + 'deg');
+      piece.style.animationDelay = (Math.random() * 90).toFixed(0) + 'ms';
+      piece.style.animationDuration = (900 + Math.random() * 500).toFixed(0) + 'ms';
+      dropLayer.appendChild(piece);
+      piece.addEventListener('animationend', () => piece.remove(), { once: true });
+    });
+  }
+
+  overlay.addEventListener('click', e => {
+    const hit = e.target.closest('.hit');
+    if (!hit) return;
+    e.preventDefault();
+    const region = hit.dataset.region;
+    // clicking the selected colour again clears it
+    select(region === pinned ? null : region, true);
+    dropRegion(region);
+    hit.blur();
+  });
+
+  addEventListener('keydown', e => {
+    if (e.key === 'Escape' && pinned) select(null, true);
+  });
+
+  // clicking anywhere outside the card clears the selection
+  document.addEventListener('click', e => {
+    if (e.target.closest('.overlay')) return;
+    if (!pinned) return;
+    select(null, true);
+  });
+</script>
+
+</body>
+</html>

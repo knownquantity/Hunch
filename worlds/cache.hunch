@@ -1,0 +1,130 @@
+// Cache -- a four-slot cache that has to choose its own eviction policy.
+// Try: ./bin/hunch train worlds/cache.hunch --budget 2000000
+//
+// The request stream is a mix: mostly a handful of hot keys, plus a scan of
+// one-touch keys every fifteen requests -- and halfway through, the hot set
+// moves. Plain LRU throws away hot keys to make room for scan entries it will
+// never see again. Plain LFU keeps yesterday's favourites forever. A good
+// policy has to notice both.
+//
+// Every cache hit is worth 1. On a miss with a full cache, the eviction choice
+// is a `hunch` blank. The observation includes how stale each slot is, how
+// often it has been used, and whether the incoming request looks like scan
+// traffic. Deciding what to throw away is the blank `hunch train` fills in.
+
+world Cache
+
+horizon 60
+
+record Slot {
+  key: int;
+  last: int;
+  freq: int;
+}
+
+state {
+  slots: Slot[4];
+  req: int[60];
+  cursor: int = 0;
+  hits: int = 0;
+}
+
+init {
+  cursor = 0;
+  hits = 0;
+  for s in 0..4 {
+    slots[s].key = -1;
+    slots[s].last = 0;
+    slots[s].freq = 0;
+  }
+
+  // The hot set moves halfway through: keys 1-5 stop, keys 6-10 take over.
+  // Any policy that only remembers "what was popular once" never adapts.
+  // Every twelve requests a burst of three one-touch keys scans through.
+  for i in 0..60 {
+    if i < 30 {
+      req[i] = 1 + floor(rand() * rand() * 5.0);
+    } else {
+      req[i] = 6 + floor(rand() * rand() * 5.0);
+    }
+    if i % 12 >= 9 {
+      req[i] = 200 + i;
+    }
+  }
+}
+
+step {
+  // The world checks its own rules. If an invariant below is ever false the run
+  // stops with the line, instead of training on a state that cannot happen.
+  assert cursor < 60;
+
+  let want = req[cursor];
+
+  let hit = -1;
+  for s in 0..4 {
+    if slots[s].key == want {
+      hit = s;
+    }
+  }
+
+  if hit >= 0 {
+    hits = hits + 1;
+    reward(1.0);
+    slots[hit].freq = slots[hit].freq + 1;
+    slots[hit].last = step_count();
+  } else {
+    let empty = -1;
+    for s in 0..4 {
+      if slots[s].key == -1 {
+        empty = s;
+      }
+    }
+
+    let slot = empty;
+    if empty < 0 {
+      // the real decision: who gets evicted?
+      let scan = 0.0;
+      if want > 10 {
+        scan = 1.0;
+      }
+
+      // Absolute values say how stale or popular a slot is. Values measured
+      // against the average say whether it is the coldest one -- which is the
+      // comparison an eviction actually needs.
+      // One observation per slot, built in a loop. The sums are computed
+      // before dividing so the arithmetic is identical to writing it out.
+      let sum_age = 0.0;
+      let sum_freq = 0.0;
+      for s in 0..4 {
+        sum_age = sum_age + (step_count() - slots[s].last);
+        sum_freq = sum_freq + slots[s].freq;
+      }
+      let mean_age = sum_age / 4.0;
+      let mean_freq = sum_freq / 4.0;
+
+      let obs: float[17];
+      for s in 0..4 {
+        let age = step_count() - slots[s].last;
+        obs[s] = age / 60.0;
+        obs[4 + s] = (age - mean_age) / 30.0;
+        obs[8 + s] = slots[s].freq / 20.0;
+        obs[12 + s] = (slots[s].freq - mean_freq) / 10.0;
+      }
+      obs[16] = scan;
+
+      slot = hunch evictor(obs, 4);
+    }
+
+    assert slot >= 0 && slot < 4;
+    slots[slot].key = want;
+    slots[slot].last = step_count();
+    slots[slot].freq = 1;
+  }
+
+  assert hits <= cursor + 1;
+
+  cursor = cursor + 1;
+  if cursor >= 60 {
+    done();
+  }
+}

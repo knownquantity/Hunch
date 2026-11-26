@@ -1,0 +1,68 @@
+name: tests
+
+# The determinism tests are the only thing guarding the central claim of this
+# project: that replaying a world from the same seed produces a bit-identical
+# run, and that a snapshot really does contain the whole universe. If that ever
+# regresses, nothing crashes -- training still runs and the numbers still look
+# plausible, they are just wrong. That is exactly the failure mode worth
+# catching automatically.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Show toolchain
+        run: |
+          python3 --version
+          gcc --version | head -1
+
+      - name: Compile every world
+        run: |
+          for f in worlds/*.hunch; do
+            echo "--- $f"
+            ./bin/hunch check "$f"
+          done
+
+      - name: Tests
+        run: python3 tests/test_compiler.py
+
+      - name: Python package
+        # Environments, forks, grading and search need only the standard
+        # library; numpy, gymnasium and pettingzoo are for the bindings.
+        run: |
+          python3 -m pip install --quiet numpy gymnasium pettingzoo
+          python3 tests/test_bindings.py
+
+      - name: Installs with pip and runs outside the checkout
+        run: |
+          python3 -m venv /tmp/hunch-venv
+          /tmp/hunch-venv/bin/pip install --quiet .
+          cd /tmp && HUNCH_HOME=/tmp/hunch-home /tmp/hunch-venv/bin/python -c "
+          import hunch
+          world = hunch.example('kuhn')
+          solved = world.train(out='/tmp/kuhn.hpol')
+          assert abs(solved.value['alice'] + 1 / 18) < 2e-3, solved.value
+          print(world.grade({'alice': lambda obs, legal: 'bet'}, against=solved))"
+
+      - name: Exact answers against brute force
+        # Random small worlds: every exact score, best reply and claim of
+        # "optimal" or "equilibrium" is checked against plain enumeration.
+        run: python3 tests/fuzz_exact.py 0 200
+
+      - name: Cache baselines
+        # Deterministic given the seeds, so it is safe to assert on.
+        run: python3 benchmarks/cache_baselines.py
