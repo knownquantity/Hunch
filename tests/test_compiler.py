@@ -158,7 +158,10 @@ def test_cli_test_reports_what_ran():
         out = subprocess.run([str(ROOT / "bin" / "hunch"), "test", str(path)],
                              capture_output=True, text=True, cwd=str(ROOT))
         assert out.returncode == 0, f"exit {out.returncode}: {out.stderr}"
-        lines = out.stdout.strip().splitlines()
+        # first what the compiler made of the file, then the result and its warnings
+        shape, lines = out.stdout.strip().split(f"\n{path}: ", 1)
+        assert shape.startswith("world      W\n") and "this world has no decisions" in shape, shape
+        lines = lines.splitlines()
         assert len(lines) == 3, out.stdout
         assert "3 episode(s), 1 of 2 assertions ran and held, 1 never ran (line 10)" \
             in lines[0], lines[0]
@@ -1024,8 +1027,148 @@ def test_exact_claims_survive_extremes():
         assert 0.4 < rep["return"][0] < 0.6, rep["return"]
 
 
-def test_cli_check_output():
-    out = subprocess.run([str(ROOT / "bin" / "hunch"), "check",
+# ---------------------------------------------------------------------------
+# Search: the policy for a world too big to follow whole with nothing hidden
+# ---------------------------------------------------------------------------
+
+def _train_vm(world: Path, pol: Path, *flags) -> dict:
+    """`train` in the runtime itself: the choice of method is made there."""
+    hbc, _ = cli.compile_file(world)
+    proc = vm(["train", str(hbc), "--out", str(pol), "--json"] + [str(f) for f in flags])
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def test_train_makes_a_search_for_connect_four():
+    """Connect Four cannot be followed whole and hides nothing, so `auto`
+    saves a search. (--exact-nodes only makes "too big" quick to find out.)"""
+    from hunch import show
+    world = ROOT / "worlds" / "connect4.hunch"
+    with tempfile.TemporaryDirectory() as d:
+        pol = Path(d) / "c4.hpol"
+        tr = _train_vm(world, pol, "--algo", "auto", "--exact-nodes", "50000", "--think", "0.02")
+        assert tr["algo"] == "mcts" and tr["method"] == "mcts" and tr["chosen"] is True, tr
+        assert tr["hidden"] == "nothing" and tr["not_whole"] == "big:50000", tr
+        seen = tr["hidden_check"]
+        assert seen["conflicts"] == 0 and seen["repeats"] >= seen["min_repeats"], seen
+        assert seen["distinct"] >= seen["min_distinct"], seen
+        assert tr["playouts"] >= 16 and tr["playouts_per_sec"] > 0, tr
+        # about --think seconds of the playouts measured, to two figures
+        want = tr["playouts_per_sec"] * 0.02
+        assert 0.9 * want - 1 <= tr["playouts"] <= 1.1 * want + 1, tr
+        head = pol.read_text().split()
+        assert head[:4] == ["HUNCHSEARCH", "1", "world", "ConnectFour"], head
+        assert head[4:6] == ["playouts", str(tr["playouts"])], head
+        said = show.how_trained(tr)
+        assert "too big to follow whole (more than 50,000 positions)" in said, said
+        assert "in 40,000 sampled positions nothing an agent was shown hid anything from it" \
+            in said and "so the policy is a search" in said, said
+        assert f"{tr['playouts']:,} playouts a decision" in said, said
+        out = hunch("score", world, "--policy", pol, "--score-sec", "1")
+        assert out.returncode == 0, out.stderr
+        text = out.stdout
+        assert "the policy is a search" in text and "± is one standard error" in text, text
+        assert "searching against opponents playing at random" in text, text
+        assert "played for about 1 s" in text and "episode" in text, text
+        rep = hunch_json("score", world, "--policy", pol, "--score-sec", "1", "--json")
+        assert rep["exact"] is False and rep["why"] == "search" and rep["rows"] == [], rep
+        assert rep["episodes"] >= 1 and all(n >= 1 for n in rep["vs_random_episodes"]), rep
+        assert rep["sec"] < 10, f"scoring for 1 s took {rep['sec']} s"
+
+
+def test_search_replays_and_explains():
+    """A search draws nothing from the world's random stream and is seeded by
+    the instant, so an episode replays exactly; `play` relies on that, and
+    `why` says what the search found."""
+    world = ROOT / "worlds" / "tictactoe.hunch"
+    with tempfile.TemporaryDirectory() as d:
+        pol = Path(d) / "t.hpol"
+        tr = _train_vm(world, pol, "--algo", "mcts", "--playouts", "2000")
+        assert tr["method"] == "mcts" and tr["chosen"] is False and tr["playouts"] == 2000, tr
+        assert tr["playouts_set"] is True and tr["hidden"] == "nothing", tr
+        one = hunch("run", world, "--policy", pol, "--seed", "7")
+        two = hunch("run", world, "--policy", pol, "--seed", "7")
+        assert one.returncode == 0, one.stderr
+        assert one.stdout == two.stdout, "the same seed played two different episodes"
+        assert "a search, 2,000 playouts a decision" in one.stdout, one.stdout
+        assert "of 2,000 playouts tried it" in one.stdout, one.stdout
+        assert "x collected 0, o collected 0" in one.stdout, one.stdout
+        # the same episode through the raw trace, twice, in one process and two
+        hbc, _ = cli.compile_file(world)
+        a = vm(["trace", str(hbc), "--policy", str(pol), "--seed", "7", "--episodes", "2"]).stdout
+        b = vm(["trace", str(hbc), "--policy", str(pol), "--seed", "7", "--episodes", "2"]).stdout
+        assert a == b and json.loads(a)["episodes"][0]["steps"], a[:200]
+
+        # play re-runs the episode from the start for every move: it only works
+        # if the search answers the same instant the same way each time
+        out = hunch("play", world, "--policy", pol, "--seed", "3", "--as", "o",
+                    stdin="".join(f"{k}\n" for k in list(range(9)) * 5))
+        assert out.returncode == 0, out.stderr
+        assert "(a search, 2,000 playouts a decision)" in out.stdout, out.stdout
+        assert "ended after" in out.stdout and "(you)" in out.stdout, out.stdout
+        assert "o collected +1" not in out.stdout, "taking the first free square beat the search"
+
+        why = hunch_json("why", world, "--policy", pol, "--seed", "7", "--json")
+        assert why["search"]["playouts"] == 2000 and "samples" not in why, why
+        trace = json.loads(a)["episodes"][0]
+        assert len(why["decisions"]) == len(trace["steps"])
+        for dec, step in zip(why["decisions"], trace["steps"]):
+            assert dec["action"] == step["d"][0]["action"], (dec, step["d"])
+            tries, value = dec["tries"], dec["value"]
+            assert sum(tries) == 2000 and tries[dec["action"]] == max(tries), dec
+            for k in range(9):
+                legal = (dec["legal"] >> k) & 1
+                assert legal or (tries[k] == 0 and value[k] is None), dec
+                assert not legal or (tries[k] > 0 and -1 <= value[k] <= 1), dec
+        text = hunch("why", world, "--policy", pol, "--seed", "7").stdout
+        assert "Nothing was replayed" in text and "the closest call: step" in text, text
+        text = hunch("why", world, "--policy", pol, "--seed", "7", "--step", "2").stdout
+        assert "the action most of its 2,000 playouts tried" in text, text
+        assert "playouts   they collected" in text and "taken" in text, text
+
+
+def test_hidden_information_keeps_its_method():
+    """A search reads the whole state, so `auto` picks it only on evidence
+    that the agents are shown all of it."""
+    from hunch import show
+    with tempfile.TemporaryDirectory() as d:
+        pol = Path(d) / "p.hpol"
+        # Kuhn poker, kept out of the exact path: a card is hidden from each player.
+        tr = _train_vm(ROOT / "worlds" / "kuhn.hunch", pol, "--algo", "auto",
+                       "--exact-nodes", "0", "--budget", "20000")
+        assert tr["algo"] == "regret" and tr["method"] == "sampled", tr
+        assert tr["hidden"] == "found" and tr["hidden_check"]["conflicts"] > 0, tr
+        assert pol.read_text().startswith("HUNCHTAB 1"), pol.read_text()[:40]
+        # The market maker is shown measurements that never repeat: no evidence
+        # either way, so it keeps the network.
+        tr = _train_vm(ROOT / "worlds" / "market.hunch", pol, "--algo", "auto",
+                       "--budget", "4000")
+        assert tr["algo"] == "ppo" and tr["hidden"] == "unknown", tr
+        assert tr["hidden_check"]["conflicts"] == 0, tr
+        assert pol.read_text().startswith("HUNCHPOL 1"), pol.read_text()[:40]
+        # Forced, the search is made anyway, and says what it looks at.
+        tr = _train_vm(ROOT / "worlds" / "kuhn.hunch", pol, "--algo", "mcts", "--playouts", "200")
+        assert tr["method"] == "mcts" and tr["chosen"] is False and tr["hidden"] == "found", tr
+        said = show.how_trained(tr)
+        assert "as asked (--algo mcts)" in said, said
+        assert "looks at the whole state, including what its agent is not shown" in said, said
+        text = hunch("score", ROOT / "worlds" / "kuhn.hunch", "--policy", pol,
+                     "--score-sec", "0.5").stdout
+        assert text.count("looks at the whole state, including what its agent is not shown") \
+            == 2, text
+        run = hunch("run", ROOT / "worlds" / "kuhn.hunch", "--policy", pol).stdout
+        assert "including what its agent is not shown" in run, run
+    # a policy file that names another world is refused, whatever its kind
+    with tempfile.TemporaryDirectory() as d:
+        pol = Path(d) / "other.hpol"
+        pol.write_text("HUNCHSEARCH 1\nworld Elsewhere\nplayouts 100\nexplore 1\n")
+        out = hunch("run", ROOT / "worlds" / "kuhn.hunch", "--policy", pol)
+        assert out.returncode != 0 and "could not read policy" in out.stderr, out.stderr
+
+
+def test_cli_test_shows_shape():
+    # `test` first says what the compiler made of the file
+    out = subprocess.run([str(ROOT / "bin" / "hunch"), "test",
                           str(ROOT / "worlds" / "cache.hunch")],
                          capture_output=True, text=True, cwd=str(ROOT))
     assert out.returncode == 0, out.stderr
@@ -1033,6 +1176,19 @@ def test_cli_check_output():
     assert "17 observation dims" in out.stdout
     horizon = next(line for line in out.stdout.splitlines() if line.startswith("horizon"))
     assert horizon.split()[2:] == ["steps"], horizon
+    # an array shown whole reads as one range, not 42 names
+    out = subprocess.run([str(ROOT / "bin" / "hunch"), "test",
+                          str(ROOT / "worlds" / "connect4.hunch")],
+                         capture_output=True, text=True, cwd=str(ROOT))
+    assert out.returncode == 0, out.stderr
+    assert "sees     board[0..41]\n" in out.stdout, out.stdout
+    assert "1 of 1 assertion ran and held" in out.stdout, out.stdout
+    # the commands that were folded away are gone
+    for gone in ("check", "build", "bench"):
+        out = subprocess.run([str(ROOT / "bin" / "hunch"), gone,
+                              str(ROOT / "worlds" / "kuhn.hunch")],
+                             capture_output=True, text=True, cwd=str(ROOT))
+        assert out.returncode == 2 and "invalid choice" in out.stderr, out.stderr
 
 
 def main() -> int:
@@ -1109,8 +1265,16 @@ def main() -> int:
     ]:
         check(name, fn)
 
+    print("search")
+    for name, fn in [
+        ("train makes a search for Connect Four", test_train_makes_a_search_for_connect_four),
+        ("a search replays, plays and explains", test_search_replays_and_explains),
+        ("hidden information keeps its method", test_hidden_information_keeps_its_method),
+    ]:
+        check(name, fn)
+
     print("cli")
-    check("check output", test_cli_check_output)
+    check("test shows the shape", test_cli_test_shows_shape)
 
     print()
     if FAILS:

@@ -94,12 +94,65 @@ def why_not_exact(why: str, limit: int) -> str:
                 "listed (randint can be listed)")
     if why == "off":
         return "sampled, not exact: exact scoring was turned off"
+    if why == "search":
+        return ("sampled, not exact: the policy is a search, which can be played but not "
+                "weighed over every outcome")
     return f"sampled, not exact: the world has more than {limit:,} positions"
+
+
+def hidden_words(hidden: str, check: dict) -> str:
+    """What sampling the world said about whether its agents are shown
+    everything (see shown_check in runtime/hunch_vm.c)."""
+    n = f"{check.get('positions', 0):,} sampled positions"
+    if hidden == "nothing":
+        return (f"in {n} nothing an agent was shown hid anything from it "
+                f"({check.get('repeats', 0):,} of them showed something already seen, each "
+                "time in the same instant as before)")
+    if hidden == "found":
+        return (f"in {n}, {check.get('conflicts', 0):,} showed an agent something it had "
+                "already been shown in a different instant, so something is hidden from it")
+    return (f"in {n} only {check.get('repeats', 0):,} showed an agent something already "
+            "seen, too few to tell whether anything is hidden from it")
+
+
+def how_searched(train: dict, sec: str) -> str:
+    why = train.get("not_whole", "")
+    if why.startswith("big:"):
+        size = f"too big to follow whole (more than {int(why[4:]):,} positions)"
+    elif why.startswith("rand:"):
+        _, line, col = why.split(":")
+        size = (f"cannot be followed whole (the {'randint' if int(col) < 0 else 'rand()'} "
+                f"at line {line} has too many outcomes to list)")
+    elif why == "off":
+        size = "not followed whole (that was turned off)"
+    else:
+        size = ""
+    hidden = train.get("hidden", "unknown")
+    seen = hidden_words(hidden, train.get("hidden_check", {}))
+    if train.get("playouts_set"):
+        count = (f"{train['playouts']:,} playouts a decision, as asked "
+                 f"({train['playouts_per_sec']:,.0f} a second measured on this machine)")
+    else:
+        count = (f"{train['playouts']:,} playouts a decision: {train['playouts_per_sec']:,.0f} "
+                 f"a second were measured on this machine, and a decision is given "
+                 f"{train.get('think', 0.1):g} s")
+    what = f"at each decision it forks the world and tries every action, {count} ({sec})"
+    if train.get("chosen"):
+        return f"{size}; {seen}, so the policy is a search: {what}"
+    head = "the policy is a search, as asked (--algo mcts)"
+    if size:
+        head = f"{size}; {head}"
+    if hidden == "found":
+        return (f"{head}: {what}\n  this policy looks at the whole state, including what its "
+                f"agent is not shown: {seen}")
+    return f"{head}: {what}\n  {seen}"
 
 
 def how_trained(train: dict) -> str:  # noqa: C901
     algo = train["algo"]
     sec = f"{train['wall_sec']:.1f}s"
+    if algo == "mcts":
+        return how_searched(train, sec)
     if algo == "regret":
         method = train.get("method")
         if method == "lookahead":
@@ -131,6 +184,9 @@ def report_lines(rep: dict, names: Names, rows: int = 6) -> List[str]:
     exact = rep["exact"]
     ret = rep["return"]
 
+    search = rep.get("search")
+    if search:
+        return search_report_lines(rep, names)
     if exact:
         out.append(f"scored exactly: every chance outcome and every action weighed, "
                    f"{rep['positions']:,} positions")
@@ -247,6 +303,70 @@ def report_lines(rep: dict, names: Names, rows: int = 6) -> List[str]:
     return out
 
 
+def search_report_lines(rep: dict, names: Names) -> List[str]:
+    """The report of a policy that is a search: played, not weighed, and for a
+    set time, so each figure says how many episodes it is the mean of."""
+    nag = len(names.agents)
+    search = rep["search"]
+
+    def played(n: int) -> str:
+        return f"{n:,} episode{'' if n == 1 else 's'}"
+
+    def val(v: float, sem: float, n: int) -> str:
+        # One episode has no spread to estimate an error from, and a few that
+        # all ended alike give an error of zero that means nothing.
+        if n < 2:
+            return num(v)
+        return f"{num(v)} in every one" if sem == 0 else f"{num(v)} ± {sem:.4f}"
+
+    limit = (f"played for about {rep['score_sec']:g} s" if rep.get("score_sec")
+             else "no time limit")
+    out = [f"{why_not_exact('search', 0)}; {limit}, ± is one standard error",
+           f"  the search: {search['playouts']:,} playouts a decision"]
+    if search["hidden"] == "found":
+        out.append("  this policy looks at the whole state, including what its agent is not "
+                   f"shown: {hidden_words('found', search)}")
+    elif search["hidden"] == "unknown":
+        out.append("  it looks at the whole state; whether its agents are shown all of it is "
+                   f"not known: {hidden_words('unknown', search)}")
+    out.append("")
+    n = rep["episodes"]
+    width = max(len(a) for a in names.agents)
+    everyone = "" if nag == 1 else ", every agent searching"
+    for i, name in enumerate(names.agents):
+        line = (f"  {name:<{width}}  collects {val(rep['return'][i], rep['sem'][i], n)} "
+                f"per episode")
+        if nag == 1:
+            line += (f"    (random play: {num(rep['random'][i])} ± {rep['random_sem'][i]:.4f}, "
+                     f"{played(rep['random_episodes'])})")
+        out.append(line + (f"   ({played(n)}{everyone})" if i == 0 else ""))
+    if nag > 1:
+        out.append("  with everyone playing at random:  "
+                   + ", ".join(f"{a} {num(rep['random'][i])} ± {rep['random_sem'][i]:.4f}"
+                               for i, a in enumerate(names.agents))
+                   + f"   ({played(rep['random_episodes'])})")
+        vsn = rep["vs_random_episodes"]
+        out.append("  searching against opponents playing at random:  "
+                   + ", ".join(f"{a} {val(rep['vs_random'][i], rep['vs_random_sem'][i], vsn[i])}"
+                               f" ({played(vsn[i])})" for i, a in enumerate(names.agents)))
+    out.append("  a figure from one episode, or from a few that all ended alike, has no "
+               "standard error;")
+    out.append("  hunch score --score-sec S plays for longer")
+    for i, name in enumerate(names.agents):
+        acts = names.acts[name]
+        freq = rep["freq"][i]
+        tot = sum(freq)
+        if tot <= 0:
+            continue
+        mix = ", ".join(f"{acts[a]} {pct(freq[a] / tot)}" for a in range(len(acts))
+                        if freq[a] > 0)
+        out.append("")
+        out.append(f"what {name} does  (over all its decisions in {played(n)}: {mix})")
+        out.append("  a search keeps no table of situations: hunch run shows an episode, "
+                   "hunch why what the search found at each decision")
+    return out
+
+
 # ---------------------------------------------------------------------------
 # An episode, step by step
 # ---------------------------------------------------------------------------
@@ -281,8 +401,14 @@ def decision_text(d: dict, names: Names, by: str = "") -> str:
     name = names.agent(d["agent"])
     act = names.action(d["agent"], d["action"])
     # The share is how often the policy plays this here; a move made by a
-    # person or a script has none.
-    how = by or pct(d["probs"][d["action"]])
+    # person or a script has none. A search says how many of its playouts
+    # tried the move it plays.
+    if by:
+        how = by
+    elif "tries" in d:
+        how = f"searched: {d['tries'][d['action']]:,} of {sum(d['tries']):,} playouts tried it"
+    else:
+        how = pct(d["probs"][d["action"]])
     return f"{name} sees {names.obs(d['obs'])}, plays {act} ({how})"
 
 
@@ -461,6 +587,65 @@ def why_lines(why: dict, names: Names, detail: bool, known: Optional[dict] = Non
         out.append(f"the decision that mattered most: step {d['step']} "
                    f"(best and worst action {swing[0]:.4f} apart);  --step {d['step']} "
                    "shows it in full")
+    return out
+
+
+def why_search_lines(why: dict, names: Names, detail: bool) -> List[str]:
+    """`hunch why` for a policy that is a search: what the search found at each
+    decision of the episode. Nothing is replayed."""
+    out = []
+    if not why["decisions"]:
+        return ["no decision was made in that step"]
+    close = (None, None)
+    for d in why["decisions"]:
+        agent, took = d["agent"], d["action"]
+        name = names.agent(agent)
+        tries, value = d["tries"], d["value"]
+        legal = [a for a in range(len(tries)) if (d["legal"] >> a) & 1]
+        total = sum(tries) or 1
+        others = [tries[a] for a in legal if a != took]
+        if others and (close[0] is None or tries[took] - max(others) < close[0]):
+            close = (tries[took] - max(others), d)
+        if detail:
+            out.append(f"step {d['step']}  {name} sees {names.obs_labelled(agent, d['obs'])}")
+            out.append(f"        and plays {names.action(agent, took)}, the action most of "
+                       f"its {total:,} playouts tried")
+            out.append("")
+            width = max(len(names.short(agent, a)) for a in legal)
+            for a in legal:
+                mark = ">" if a == took else " "
+                line = f"      {mark} {names.short(agent, a):<{width}}  {tries[a]:>9,} playouts"
+                if value[a] is not None:
+                    line += f"   they collected {num(value[a])} on average"
+                out.append(line + ("   taken" if a == took else ""))
+            out.append("")
+        else:
+            cells = []
+            for a in legal:
+                mean = "" if value[a] is None else f" {num(value[a], 2)}"
+                cells.append(f"{'>' if a == took else ''}{names.short(agent, a)} "
+                             f"{pct(tries[a] / total)}{mean}")
+            out.append(f"step {d['step']:<3} {name} plays {names.short(agent, took)}"
+                       + "\n" + " " * 9 + "   ".join(cells))
+    search = why["search"]
+    if not detail:
+        out.append("")
+    out.append(f"for each action: {'how many' if detail else 'the share'} of the search's "
+               f"{search['playouts']:,} playouts at that decision tried it,")
+    out.append("and what its agent collected in them on average, from that instant to the "
+               "end of the episode.")
+    out.append("In a playout the first moves are the search's own and the rest are random, "
+               "so a mean is the")
+    out.append("search's estimate of an action, not what the action is worth against this "
+               "policy. Nothing was replayed.")
+    if search.get("hidden") == "found":
+        out.append("This search looks at the whole state, including what its agent is not "
+                   "shown.")
+    if close[1] is not None and not detail:
+        d = close[1]
+        margin = (f"{close[0]:,} more times than" if close[0] > 0 else "as many times as")
+        out.append(f"the closest call: step {d['step']} (the action played was tried "
+                   f"{margin} the next);  --step {d['step']} shows it in full")
     return out
 
 

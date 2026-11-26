@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -126,6 +127,30 @@ def compile_file(path: Path, params: dict = None) -> tuple[Path, dict]:
     return hbc, unit
 
 
+def _ranges(labels: list[str]) -> list[str]:
+    """`board[0], board[1], board[2]` as `board[0..2]`: an array shown element
+    by element, in order, reads as one range."""
+    out: list[str] = []
+    run: tuple[str, int, int] | None = None
+
+    def close():
+        if run:
+            name, lo, hi = run
+            out.append(f"{name}[{lo}]" if lo == hi else f"{name}[{lo}..{hi}]")
+
+    for label in labels:
+        m = re.fullmatch(r"(\w+)\[(\d+)\]", label)
+        if m and run and run[0] == m.group(1) and int(m.group(2)) == run[2] + 1:
+            run = (run[0], run[1], run[2] + 1)
+            continue
+        close()
+        run = (m.group(1), int(m.group(2)), int(m.group(2))) if m else None
+        if not m:
+            out.append(label)
+    close()
+    return out
+
+
 def describe(unit: dict) -> str:
     lines = [
         f"world      {unit['world']}",
@@ -140,7 +165,7 @@ def describe(unit: dict) -> str:
                 f"{unit['agent_acts'].get(name)} actions")
             labels = unit.get("agent_obs_labels", {}).get(name)
             if labels:
-                lines.append("             sees     " + ", ".join(labels))
+                lines.append("             sees     " + ", ".join(_ranges(labels)))
             acts = unit.get("agent_action_names", {}).get(name)
             if acts:
                 lines.append("             actions  " + ", ".join(acts))
@@ -152,33 +177,6 @@ def describe(unit: dict) -> str:
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
-
-def cmd_check(args) -> int:
-    path = resolve_world(args.file)
-    if not path.exists():
-        print(f"error: no such file: {path}", file=sys.stderr)
-        return 2
-    try:
-        hbc, unit = compile_file(path, parse_params(args.param))
-    except HunchError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-    print(describe(unit))
-    return 0
-
-
-def cmd_build(args) -> int:
-    path = resolve_world(args.file)
-    try:
-        hbc, unit = compile_file(path, parse_params(args.param))
-    except HunchError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-    out = Path(args.out) if args.out else path.with_suffix(".hbc")
-    out.write_bytes(hbc.read_bytes())
-    print(f"built {out} ({out.stat().st_size} bytes)")
-    return 0
-
 
 def _vm(args_str: list[str], capture: bool = True) -> subprocess.CompletedProcess:
     ensure_vm()
@@ -209,8 +207,32 @@ def find_policy(args, path: Path):
     return str(default) if default.exists() else None
 
 
+def search_header(policy) -> dict:
+    """The fields of a policy file that is a search (`HUNCHSEARCH 1`: world,
+    playouts, explore, hidden, checked); {} for a table, networks or no file."""
+    try:
+        with open(policy) as f:
+            lines = [f.readline().split() for _ in range(6)]
+    except (OSError, TypeError, UnicodeDecodeError):
+        return {}
+    if not lines[0] or lines[0][0] != "HUNCHSEARCH":
+        return {}
+    return {words[0]: words[1:] for words in lines[1:] if words}
+
+
 def policy_words(policy) -> str:
-    return f"policy {policy}" if policy else "no policy, so every agent plays at random"
+    if not policy:
+        return "no policy, so every agent plays at random"
+    head = search_header(policy)
+    if not head:
+        return f"policy {policy}"
+    try:
+        words = f"policy {policy} (a search, {int(head['playouts'][0]):,} playouts a decision"
+    except (KeyError, IndexError, ValueError):
+        return f"policy {policy} (a search)"
+    if head.get("hidden") == ["found"]:
+        words += "; it looks at the whole state, including what its agent is not shown"
+    return words + ")"
 
 
 def _vm_json(cmd: list[str], policy=None):
@@ -335,10 +357,14 @@ def _report(hbc: Path, policy, args):
     elif getattr(args, "exact_nodes", None) is not None:
         cmd += ["--exact-nodes", str(args.exact_nodes)]
     cmd += ["--rows", str(max(getattr(args, "rows", 6), 6))]
+    if getattr(args, "score_sec", None) is not None:
+        cmd += ["--score-sec", str(args.score_sec)]
     rep = _vm_json(cmd, policy)
     if rep is None:
         return None
-    if known_big:
+    if rep.get("why") == "search":
+        pass                                        # sampled because of what the policy is
+    elif known_big:
         rep["why"], rep["limit"] = "big", _exact_limit(args)
     elif not rep["exact"] and rep["why"] == "big":
         _note_too_big(hbc, args)
@@ -453,6 +479,18 @@ def cmd_why(args) -> int:
         print(f"hunch: {path} has no `hunch` blank, so no decision was made",
               file=sys.stderr)
         return 1
+    if "search" in why:
+        # A search has already compared the actions at each decision; nothing
+        # is replayed, and there is no table of situations to look up.
+        if args.json:
+            print(json.dumps(why))
+            return 0
+        print(f"{unit['world']}, seed {args.seed}, {policy_words(policy)}")
+        print("the episode ended with "
+              + ", ".join(f"{n} {show.num(v)}" for n, v in zip(names.agents, why["returns"])))
+        print()
+        print("\n".join(show.why_search_lines(why, names, detail=bool(args.step))))
+        return 0
     known = _situation_values(hbc, policy, args)
     if args.json:
         for d in why["decisions"]:
@@ -574,6 +612,9 @@ def cmd_test(args) -> int:
     plausible-looking learning curve.
     """
     path = resolve_world(args.file)
+    if not path.exists():
+        print(f"error: no such file: {path}", file=sys.stderr)
+        return 2
     if args.episodes < 1:
         print("hunch: test needs at least one episode", file=sys.stderr)
         return 2
@@ -582,6 +623,9 @@ def cmd_test(args) -> int:
     except HunchError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+    # What the compiler made of the file: each agent, what it is shown and
+    # what it can do. A blank that sees the wrong thing shows up here.
+    print(describe(unit))
     cmd = ["trace", str(hbc), "--seed", str(args.seed),
            "--episodes", str(args.episodes), "--strict"]
     proc = _vm(cmd)
@@ -643,11 +687,13 @@ def cmd_train(args) -> int:
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     cmd = ["train", str(hbc), "--algo", args.algo, "--seed", str(args.seed), "--out", out,
            "--eval-episodes", str(args.eval_episodes), "--json", "--progress"]
-    exact_nodes = 0 if _too_big(hbc, args) else args.exact_nodes
+    known_big = _too_big(hbc, args)
+    exact_nodes = 0 if known_big else args.exact_nodes
     for flag, value in (("--budget", args.budget), ("--lr", args.lr),
                         ("--entropy", args.entropy), ("--fork-points", args.fork_points),
                         ("--fork-ratio", args.fork_ratio), ("--rollout", args.rollout),
                         ("--target", args.target), ("--max-sec", args.max_sec),
+                        ("--think", args.think), ("--playouts", args.playouts),
                         ("--exact-nodes", exact_nodes)):
         if value is not None:
             cmd += [flag, str(value)]
@@ -681,7 +727,14 @@ def cmd_train(args) -> int:
     train = json.loads(stdout.strip().splitlines()[-1])
     if train.get("not_whole", "").startswith("big:"):
         _note_too_big(hbc, args)
+    elif known_big and train.get("not_whole") == "off":
+        # An earlier command found the world too big, so this one did not try.
+        train["not_whole"] = f"big:{_exact_limit(args)}"
     policy = out if train["algo"] != "random" else None
+    if train.get("method") == "mcts" and args.score_sec is None:
+        # Scoring a search is playing it, and that is slow: a short sample
+        # here, and `hunch score` for a longer one.
+        args.score_sec = TRAIN_SCORE_SEC
     rep = _report(hbc, policy, args)
     if rep is None:
         return 1
@@ -696,98 +749,8 @@ def cmd_train(args) -> int:
     return 0
 
 
-ALGOS = ["auto", "regret", "ppo", "fork", "reinforce", "random"]
-
-
-def cmd_bench(args) -> int:
-    path = resolve_world(args.file)
-    try:
-        hbc, unit = compile_file(path, parse_params(args.param))
-    except HunchError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-
-    algos = args.algos.split(",")
-    seeds = [int(s) for s in args.seeds.split(",")]
-    jobs = args.jobs
-
-    tasks = []
-    for algo in algos:
-        for seed in seeds:
-            out = CACHE / f"{path.stem}.{algo}.{seed}.hpol"
-            cmd = [str(VM_BIN), "train", str(hbc), "--algo", algo,
-                   "--budget", str(args.budget), "--seed", str(seed),
-                   "--out", str(out), "--eval-episodes", str(args.eval_episodes),
-                   "--json"]
-            if args.horizon:
-                cmd += ["--horizon", str(args.horizon)]
-            if args.entropy is not None:
-                cmd += ["--entropy", str(args.entropy)]
-            tasks.append((algo, seed, cmd))
-
-    ensure_vm()
-    results = {}
-    procs = []
-    running = []
-
-    def launch(task):
-        algo, seed, cmd = task
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        running.append((algo, seed, p))
-
-    it = iter(tasks)
-    for _ in range(min(jobs, len(tasks))):
-        try:
-            launch(next(it))
-        except StopIteration:
-            break
-
-    while running:
-        algo, seed, p = running.pop(0)
-        out, err = p.communicate()
-        if p.returncode != 0:
-            print(err, file=sys.stderr)
-            return 1
-        try:
-            data = json.loads(out.strip().splitlines()[-1])
-        except (json.JSONDecodeError, IndexError):
-            print(f"bad output for {algo}/{seed}: {out!r}", file=sys.stderr)
-            return 1
-        results.setdefault(algo, []).append(data)
-        if args.verbose:
-            print(f"  {algo:9s} seed={seed:<4d} return={data['final_return']:9.4f} "
-                  f"wall={data['wall_sec']:.2f}s", file=sys.stderr)
-        try:
-            launch(next(it))
-        except StopIteration:
-            pass
-
-    summary = {"world": unit["world"], "budget": args.budget,
-               "horizon": args.horizon or unit["horizon"], "algos": {}}
-    for algo, runs in results.items():
-        finals = [r["final_return"] for r in runs]
-        mean = sum(finals) / len(finals)
-        var = sum((x - mean) ** 2 for x in finals) / len(finals)
-        summary["algos"][algo] = {
-            "mean": mean,
-            "std": var ** 0.5,
-            "best": max(finals),
-            "runs": runs,
-        }
-
-    text = json.dumps(summary, indent=2)
-    if args.out:
-        Path(args.out).write_text(text)
-        print(f"wrote {args.out}")
-    if args.print_summary or not args.out:
-        print(f"\n{unit['world']}  (budget {args.budget:,} env steps per run)")
-        print(f"{'algo':10s} {'mean':>10s} {'std':>8s} {'best':>10s}")
-        for algo in algos:
-            if algo not in summary["algos"]:
-                continue
-            s = summary["algos"][algo]
-            print(f"{algo:10s} {s['mean']:10.3f} {s['std']:8.3f} {s['best']:10.3f}")
-    return 0
+ALGOS = ["auto", "regret", "mcts", "ppo", "fork", "reinforce", "random"]
+TRAIN_SCORE_SEC = 5.0       # how long `train` plays a search to score it; `score` takes 15 s
 
 
 def cmd_studio(args) -> int:
@@ -813,17 +776,46 @@ def build_parser() -> argparse.ArgumentParser:
         description="Hunch: write the rules, leave the decisions blank.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sp = sub.add_parser("check", help="compile a world and report its shape")
+    sp = sub.add_parser("test", help="compile a world, show what each agent sees, and check its rules")
     sp.add_argument("file")
-    sp.add_argument("--param", action="append", metavar="NAME=VALUE",
-                    help="override a world param (repeatable)")
-    sp.set_defaults(func=cmd_check)
+    sp.add_argument("--episodes", type=int, default=3)
+    sp.add_argument("--seed", type=int, default=1)
+    sp.add_argument("--param", action="append", metavar="NAME=VALUE")
+    sp.set_defaults(func=cmd_test)
 
-    sp = sub.add_parser("build", help="compile to bytecode")
+    sp = sub.add_parser("train", help="learn the blanks")
     sp.add_argument("file")
     sp.add_argument("--param", action="append", metavar="NAME=VALUE")
-    sp.add_argument("-o", "--out")
-    sp.set_defaults(func=cmd_build)
+    sp.add_argument("--algo", default="auto", choices=ALGOS,
+                    help="auto (default): the exact answer when the world is small enough "
+                         "to follow whole; else a search at play time (mcts) when sampling "
+                         "finds nothing hidden from the agents; else ppo for one agent and "
+                         "regret for several")
+    sp.add_argument("--think", type=float, metavar="SECONDS",
+                    help="mcts: playouts per decision are chosen to take about this long on "
+                         "this machine (default 0.1), then saved in the policy")
+    sp.add_argument("--playouts", type=int, help="mcts: playouts per decision, set directly")
+    sp.add_argument("--score-sec", type=float, metavar="SECONDS",
+                    help="mcts: how long the search is played to score it (default 5)")
+    sp.add_argument("--budget", type=int,
+                    help="environment steps (default 200,000; 2,000,000 for sampled regret)")
+    sp.add_argument("--seed", type=int, default=1)
+    sp.add_argument("--out", help="where the policy goes (default: beside the world, .hpol)")
+    sp.add_argument("--eval-episodes", type=int, default=128)
+    sp.add_argument("--rows", type=int, default=6, help="situations listed per agent")
+    sp.add_argument("--target", type=float,
+                    help="exact regret stops when no agent can gain more than this alone "
+                         "(default 0.001)")
+    sp.add_argument("--max-sec", type=float, help="and after this long (default 60)")
+    sp.add_argument("--exact-nodes", type=int,
+                    help="largest world followed whole, in positions (default 2,000,000)")
+    sp.add_argument("--lr", type=float)
+    sp.add_argument("--entropy", type=float)
+    sp.add_argument("--fork-points", type=int)
+    sp.add_argument("--fork-ratio", type=float)
+    sp.add_argument("--rollout", type=int)
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_train)
 
     sp = sub.add_parser("run", help="play an episode and print it step by step")
     sp.add_argument("file")
@@ -867,6 +859,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--policy", help=POLICY_HELP)
     sp.add_argument("--rows", type=int, default=6, help="situations listed per agent")
     sp.add_argument("--episodes", type=int, help="episodes sampled when it cannot be exact")
+    sp.add_argument("--score-sec", type=float, metavar="SECONDS",
+                    help="a search policy is scored by playing it for about this long "
+                         "(default 15; 0 for no limit, with --episodes)")
     sp.add_argument("--exact-nodes", type=int,
                     help="largest world scored exactly, in positions (default 2,000,000)")
     sp.add_argument("--json", action="store_true")
@@ -892,54 +887,6 @@ def build_parser() -> argparse.ArgumentParser:
                     help="largest world graded exactly, in positions (default 2,000,000)")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_grade)
-
-    sp = sub.add_parser("test", help="check a world's rules before training")
-    sp.add_argument("file")
-    sp.add_argument("--episodes", type=int, default=3)
-    sp.add_argument("--seed", type=int, default=1)
-    sp.add_argument("--param", action="append", metavar="NAME=VALUE")
-    sp.set_defaults(func=cmd_test)
-
-    sp = sub.add_parser("train", help="learn the blanks")
-    sp.add_argument("file")
-    sp.add_argument("--param", action="append", metavar="NAME=VALUE")
-    sp.add_argument("--algo", default="auto", choices=ALGOS,
-                    help="auto (default): the exact answer when the world is small enough "
-                         "to follow whole, else ppo for one agent and regret for several")
-    sp.add_argument("--budget", type=int,
-                    help="environment steps (default 200,000; 2,000,000 for sampled regret)")
-    sp.add_argument("--seed", type=int, default=1)
-    sp.add_argument("--out", help="where the policy goes (default: beside the world, .hpol)")
-    sp.add_argument("--eval-episodes", type=int, default=128)
-    sp.add_argument("--rows", type=int, default=6, help="situations listed per agent")
-    sp.add_argument("--target", type=float,
-                    help="exact regret stops when no agent can gain more than this alone "
-                         "(default 0.001)")
-    sp.add_argument("--max-sec", type=float, help="and after this long (default 60)")
-    sp.add_argument("--exact-nodes", type=int,
-                    help="largest world followed whole, in positions (default 2,000,000)")
-    sp.add_argument("--lr", type=float)
-    sp.add_argument("--entropy", type=float)
-    sp.add_argument("--fork-points", type=int)
-    sp.add_argument("--fork-ratio", type=float)
-    sp.add_argument("--rollout", type=int)
-    sp.add_argument("--json", action="store_true")
-    sp.set_defaults(func=cmd_train)
-
-    sp = sub.add_parser("bench", help="compare algorithms on equal budgets")
-    sp.add_argument("file")
-    sp.add_argument("--param", action="append", metavar="NAME=VALUE")
-    sp.add_argument("--budget", type=int, default=200000)
-    sp.add_argument("--algos", default="random,ppo,fork")
-    sp.add_argument("--seeds", default="1,2,3,4,5")
-    sp.add_argument("--eval-episodes", type=int, default=128)
-    sp.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2)))
-    sp.add_argument("--horizon", type=int)
-    sp.add_argument("--entropy", type=float)
-    sp.add_argument("--out")
-    sp.add_argument("--print-summary", action="store_true")
-    sp.add_argument("--verbose", action="store_true")
-    sp.set_defaults(func=cmd_bench)
 
     sp = sub.add_parser("studio", help="serve the interactive Hunch Studio")
     sp.add_argument("--port", type=int, default=8000)

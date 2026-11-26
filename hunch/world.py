@@ -93,7 +93,9 @@ def _legal_list(mask: int, n: int) -> List[int]:
 
 class Policy:
     """A policy file for a world: what `hunch train` saves. A table (one row
-    for everything an agent can be shown) or a small network."""
+    for everything an agent can be shown), a small network, or a search (for
+    a world too big to follow whole in which nothing is hidden: it plays in an
+    `Env`, and has no `probs` for an observation)."""
 
     def __init__(self, world: "World", path: Union[str, Path]):
         self.world = world
@@ -121,7 +123,10 @@ class Policy:
             mask |= 1 << w.action_index(agent, a)
         out = (ctypes.c_double * MAX_ACT)()
         buf = (ctypes.c_double * MAX_OBS)(*[float(v) for v in obs])
-        if w._lib.hunch_env_policy_probs(self._env._p, k, buf, mask, out) < 0:
+        got = w._lib.hunch_env_policy_probs(self._env._p, k, buf, mask, out)
+        if got == -2:
+            self._env._fail()                       # a search: the runtime says why not
+        if got < 0:
             raise ValueError("no legal action")
         return list(out[:n])
 
@@ -579,27 +584,36 @@ class World:
 
     def train(self, algo: str = "auto", out: Union[str, Path, None] = None, seed: int = 1,
               budget: Optional[int] = None, target: Optional[float] = None,
-              max_sec: Optional[float] = None, exact_nodes: Optional[int] = None) -> Trained:
+              max_sec: Optional[float] = None, exact_nodes: Optional[int] = None,
+              think: Optional[float] = None, playouts: Optional[int] = None,
+              score_sec: Optional[float] = None) -> Trained:
         """Fill the blanks, as `hunch train` does, and return the policy with
         its report. The policy is saved beside the world unless `out` says
         where (`.path` on the result is where it went; for a world that ships
         with an installed Hunch, that is under HUNCH_HOME). `target` is the
         NashConv the solver stops at (default 0.001): make it smaller for a
-        sharper reference to grade against."""
+        sharper reference to grade against. When the policy is a search
+        (`algo="mcts"`, or chosen by "auto"), `think` is the seconds a decision
+        is given on this machine and `playouts` sets the count directly;
+        `score_sec` is how long it is played to score it (default 5)."""
         if not self.agents:
             raise ValueError(f"{self.name} has no `hunch` blank, so there is nothing to train")
         out = Path(out) if out else cli.policy_beside(self.path)
         out.parent.mkdir(parents=True, exist_ok=True)
         cmd = ["train", self.hbc, "--algo", algo, "--seed", seed, "--out", out, "--json"]
         for flag, value in (("--budget", budget), ("--target", target),
-                            ("--max-sec", max_sec), ("--exact-nodes", exact_nodes)):
+                            ("--max-sec", max_sec), ("--exact-nodes", exact_nodes),
+                            ("--think", think), ("--playouts", playouts)):
             if value is not None:
                 cmd += [flag, value]
         train = self._vm(cmd)
-        return Trained(self, out, train, self.score(out, exact_nodes=exact_nodes))
+        if train.get("method") == "mcts" and score_sec is None:
+            score_sec = cli.TRAIN_SCORE_SEC
+        return Trained(self, out, train,
+                       self.score(out, exact_nodes=exact_nodes, score_sec=score_sec))
 
     def score(self, policy=None, exact_nodes: Optional[int] = None, episodes: Optional[int] = None,
-              rows: int = 400) -> dict:
+              rows: int = 400, score_sec: Optional[float] = None) -> dict:
         """The report `hunch score --json` gives for a policy (None: uniform
         random play): what each agent collects, the best reply to it, and what
         it does in the situations it meets most."""
@@ -610,6 +624,8 @@ class World:
             cmd += ["--exact-nodes", exact_nodes]
         if episodes is not None:
             cmd += ["--episodes", episodes]
+        if score_sec is not None:                   # a search is played for this long
+            cmd += ["--score-sec", score_sec]
         return self._vm(cmd)
 
     def situations(self, agent: Optional[str] = None, policy=None,

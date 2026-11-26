@@ -479,6 +479,76 @@ def test_search_plays_without_training():
     assert wins >= 5, f"search won only {wins} of 6 against random play"
 
 
+def train_vm(w: hunch.World, out: Path, *flags) -> dict:
+    """`train` in the runtime itself, without the report `World.train` adds:
+    scoring a search means playing it, and the tests below do that."""
+    cli.ensure_vm()
+    proc = subprocess.run([str(cli.VM_BIN), "train", str(w.hbc), "--out", str(out), "--json"]
+                          + [str(f) for f in flags], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def test_trained_search_never_loses_tictactoe():
+    """`train --algo mcts` at the playouts it chooses itself, against the
+    exactly solved policy, in each seat."""
+    t = world("tictactoe")
+    solved = t.train(out=TMP / "ttt-solved.hpol")
+    assert solved.method == "lookahead"
+    tr = train_vm(t, TMP / "ttt-search.hpol", "--algo", "mcts")
+    assert tr["method"] == "mcts" and tr["hidden"] == "nothing", tr
+    search = hunch.Policy(t, TMP / "ttt-search.hpol")
+    rng = random.Random(5)
+    for mine, theirs in (("x", "o"), ("o", "x")):
+        env = t.env(agents=[theirs], policy=search)         # `mine` is the search's seat
+        for seed in range(1, 25):
+            env.reset(seed)
+            while not env.over:
+                env.act(solved.act(theirs, env.obs, env.legal, rng))
+            assert env.returns[mine] >= 0, \
+                f"the search ({tr['playouts']} playouts) lost as {mine} on seed {seed}"
+    # The same instant gets the same reply: a fork that is not acted on
+    # differently has the same future.
+    env = t.env(agents=["x"], policy=search)
+    env.reset(4)
+    snap = env.snapshot()
+    env.act(env.legal[0])
+    first = env.memory()
+    env.restore(snap)
+    env.act(env.legal[0])
+    assert env.memory() == first, "the search answered one instant in two ways"
+    # A search chooses from an instant, not from an observation.
+    try:
+        search.probs("x", [0] * 9)
+        raise AssertionError("probs of a search did not raise")
+    except hunch.HunchRuntimeError as exc:
+        assert "search" in str(exc), exc
+    # World.train reports it the way the command does.
+    got = t.train(algo="mcts", out=TMP / "ttt-quick.hpol", playouts=300, score_sec=0.5)
+    assert got.method == "mcts" and not got.exact and got.nashconv is None, got.train
+    assert "the policy is a search" in str(got) and "300 playouts a decision" in str(got), str(got)
+
+
+def test_trained_search_wins_connect_four():
+    """`train` on Connect Four picks the search by itself, and it beats random
+    play from either seat. (--exact-nodes only makes "too big" quick to find
+    out; the choice and the playouts are train's own.)"""
+    c = world("connect4")
+    tr = train_vm(c, TMP / "c4.hpol", "--algo", "auto", "--exact-nodes", "50000")
+    assert tr["method"] == "mcts" and tr["chosen"] is True and tr["hidden"] == "nothing", tr
+    rng = random.Random(11)
+    for mine, theirs in (("first", "second"), ("second", "first")):
+        env = c.env(agents=[theirs], policy=TMP / "c4.hpol")
+        wins = 0
+        for seed in range(1, 11):
+            env.reset(seed)
+            while not env.over:
+                env.act(rng.choice(env.legal))
+            wins += env.returns[mine] == 1
+        assert wins >= 9, (f"the search ({tr['playouts']} playouts) won only {wins} of 10 "
+                           f"as {mine} against random play")
+
+
 # ---------------------------------------------------------------------------
 # numpy, gymnasium, pettingzoo
 # ---------------------------------------------------------------------------
@@ -605,6 +675,8 @@ def main() -> int:
         ]),
         ("search", [
             ("search plays without training", test_search_plays_without_training),
+            ("a trained search never loses tic-tac-toe", test_trained_search_never_loses_tictactoe),
+            ("a trained search wins Connect Four", test_trained_search_wins_connect_four),
         ]),
         ("bindings", [
             ("vec matches the exact value", test_vec_matches_the_exact_value),

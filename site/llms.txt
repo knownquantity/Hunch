@@ -6,7 +6,7 @@ blank wherever a decision is made. A world is one file. `hunch train` fills
 the blanks and reports what it found: what each agent collects, whether
 anything better exists, and what the policy does.
 
-    ./bin/hunch test  world.hunch      # run the rules with random play, check the asserts
+    ./bin/hunch test  world.hunch      # compile, show what each agent sees, check the asserts
     ./bin/hunch train world.hunch      # fill the blanks; saves world.hpol beside the world
     ./bin/hunch run   world.hunch      # one episode, step by step
     ./bin/hunch why   world.hunch      # what every other action would have been worth
@@ -283,15 +283,35 @@ without `rand()`. Then:
 A policy found on the whole world also covers situations that good play never
 reaches, so it does not fall apart against a person or a random opponent.
 
-When the world cannot be followed whole:
+When the world cannot be followed whole, `train` first checks by sampling
+whether anything is hidden from the agents: it plays random episodes and
+looks for one thing shown to an agent in two different instants of the world.
 
-- **One agent**: `ppo`, a 32x32 network, `--budget` environment steps
-  (default 200,000).
-- **Several agents**: regret matching on sampled episodes (default 2,000,000
-  steps). It needs observations that repeat.
+- **Nothing hidden was found** (a board game such as Connect Four): the policy
+  is a search (`mcts`). Nothing is learned ahead of time. At each decision the
+  policy forks the world from that instant, plays every action out many times
+  (Monte Carlo tree search with random playouts), and plays the action tried
+  most. `train` measures how fast this world is searched on this machine,
+  picks the playouts per decision so that one takes about `--think` seconds
+  (default 0.1), and saves that count in the `.hpol`; `--playouts N` sets it
+  directly. The same instant always gets the same action. The check is
+  evidence, not proof: it needs at least 1,000 repeated observations, all
+  consistent, before it says nothing is hidden.
+- **Something is hidden, or observations never repeat, one agent**: `ppo`, a
+  32x32 network, `--budget` environment steps (default 200,000).
+- **Something is hidden, or observations never repeat, several agents**:
+  regret matching on sampled episodes (default 2,000,000 steps). It needs
+  observations that repeat.
 
-Other values of `--algo`: `regret`, `ppo`, `fork` (PPO plus a replay of
-selected decisions once per action under the same random numbers),
+A search reads the whole state. `--algo mcts` forces it on any world; where
+something is hidden the report says that the policy sees what its agent is
+not shown. A search policy cannot be scored exactly: the report plays it for a
+few seconds and gives standard errors (`--score-sec S` plays for longer), and
+`hunch why` shows, for each decision of an episode, how many playouts tried
+each action and what they saw on average.
+
+Other values of `--algo`: `regret`, `ppo`, `mcts`, `fork` (PPO plus a replay
+of selected decisions once per action under the same random numbers),
 `reinforce`, `random`.
 
 ## Reading the report
@@ -344,9 +364,9 @@ the commands take a name in place of a file (`hunch train kuhn`).
     solved.probs("alice", [1, 0])            # one probability per action
     saved = hunch.Policy(world, "kuhn.hpol") # a policy file from an earlier run
 
-`world.train(out=PATH, target=G, max_sec=S, seed=N, algo=A, budget=N)` takes
-what `hunch train` takes. Wherever a policy is wanted (`policy=`, `against=`),
-a `Policy` or the path of a `.hpol` works.
+`world.train(out=PATH, target=G, max_sec=S, seed=N, algo=A, budget=N, think=S,
+playouts=N)` takes what `hunch train` takes. Wherever a policy is wanted
+(`policy=`, `against=`), a `Policy` or the path of a `.hpol` works.
 
     env = world.env(agents=["alice"], policy=solved)   # you decide alice; the rest play
     env.reset(seed=1)                                  # `policy`, or at random without one
@@ -464,18 +484,22 @@ agents play the `.hpol` beside the world, as in `run`.
     search = hunch.Search(world, playouts=1000)
     env.act(search.choose(env))              # env is left unchanged by choose
 
-Monte Carlo tree search over forks, for a world too big to follow whole. It
-reads the whole state, so use it only where the agents are shown everything.
-`search.tried` holds `{action: (tries, mean value)}` from the last call.
+Monte Carlo tree search over forks, from your own Python. `hunch train` builds
+the same kind of search into the policy for a world too big to follow whole
+(see "What `train` does"), and that one runs in C; use this class to search
+with your own environment loop. It reads the whole state, so use it only where
+the agents are shown everything. `search.tried` holds `{action: (tries, mean
+value)}` from the last call.
 
 ## CLI
 
-    hunch check <file>                 compile; print what each agent sees and its actions
-    hunch test <file> [--episodes N]   random play; which asserts ran, clamped indices, zero divisors;
-                                       a failed assert names its line, step and seed
+    hunch test <file> [--episodes N]   compile; print what each agent sees and its actions; then
+                                       random play: which asserts ran, clamped indices, zero
+                                       divisors; a failed assert names its line, step and seed
     hunch train <file> [--algo A] [--budget N] [--seed N] [--out p.hpol]
                        [--target G] [--max-sec S] [--exact-nodes N] [--json]
-    hunch score <file> [--policy p]    the report for a saved policy, without training
+                       [--think SECONDS | --playouts N] [--score-sec S]   (a search policy)
+    hunch score <file> [--policy p] [--score-sec S]   the report for a saved policy, without training
     hunch run <file> [--seed N] [--episodes N] [--json]
     hunch run <file> --agent hero --actions up,up,left   script one agent, by name or number;
                                        when the list runs out the policy takes over
@@ -483,7 +507,6 @@ reads the whole state, so use it only where the agents are shown everything.
     hunch play <file> [--as AGENT] [--seed N]
     hunch grade <file> [--agent A] (--cmd PROGRAM | --questions | --answers FILE)
                        [--policy p] [--timeout S] [--json]
-    hunch bench <file> [--algos random,ppo,fork] [--seeds 1,2,3] [--budget N]
     hunch studio [--port 8000]
 
 `run`, `why`, `play` and `score` use the `.hpol` that `train` left beside the

@@ -30,11 +30,11 @@ jobs:
           python3 --version
           gcc --version | head -1
 
-      - name: Compile every world
+      - name: Compile every world and check its rules
         run: |
           for f in worlds/*.hunch; do
             echo "--- $f"
-            ./bin/hunch check "$f"
+            ./bin/hunch test "$f"
           done
 
       - name: Tests

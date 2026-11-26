@@ -66,12 +66,16 @@ enum {
 static __thread jmp_buf g_trap;
 static __thread int g_trap_on = 0;
 static __thread char g_trap_msg[320];
+/* Set while a search is trying continuations: a rule broken in one of them
+ * was not broken by the episode itself, and the message says so. */
+static __thread int g_searching = 0;
 
 static void fatal(int code, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(g_trap_msg, sizeof(g_trap_msg), fmt, ap);
     va_end(ap);
+    g_searching = 0;
     if (g_trap_on) longjmp(g_trap, code);
     fprintf(stderr, "%s\n", g_trap_msg);
     exit(code);
@@ -652,6 +656,11 @@ typedef struct {
     int obs_dim;
     int n_act;
     uint32_t mask;      /* bit a set = action a was legal; `prob` is already masked */
+    /* A decision made by a search: how many playouts tried each action and
+     * the mean return they saw. `prob` is then 1 for the action played. */
+    int searched;
+    int tries[MAX_ACT];
+    double mean[MAX_ACT];
 } Decision;
 
 /* What `hunch test` reports beyond pass or fail: how often each assert ran,
@@ -673,11 +682,20 @@ typedef struct {
 static int g_trace_on = 0;
 static uint64_t g_trace_seed = 0;
 
+struct Search;
+static int search_choose(struct Search *S, struct VM *vm, int ip, int agent, int n_act,
+                         uint32_t legal);
+static void search_found(const struct Search *S, int *tries, double *mean);
+
 typedef struct VM {
     const Program *p;
     State *s;
     State branch;
     Net *nets[MAX_AGENTS];
+    /* When set, neither the table nor the networks decide: the world is
+     * forked at each decision and searched (see "Search" below). */
+    struct Search *search;
+    int in_init;        /* the block being run is init, not a step */
     /* When tab_mode is not TAB_OFF the table decides, not the networks. */
     Table *tab;
     int tab_mode;
@@ -841,17 +859,11 @@ static void hunch_fail(const VM *vm, int agent, const char *what, int action) {
           name, vm->legal_line, vm->legal_col);
 }
 
-static void vm_run(VM *vm, int entry) {
+/* Run from instruction `ip` with the stack, the calls and the counters as
+ * they stand: a block from its start (vm_run), or the rest of one from a
+ * decision, which is how a search continues a copy of a block in its own VM. */
+static void vm_exec(VM *vm, int ip) {
     const Program *p = vm->p;
-    int ip = entry;
-    vm->sp = 0;
-    vm->csp = 0;
-    vm->halt = 0;
-    vm->insns = 0;
-    vm->stopped = 0;
-    /* A block cut off by the instruction budget between OP_LEGAL and its
-     * OP_HUNCH must not leave its mask for the next block's first decision. */
-    vm->legal_pending = 0;
     const int32_t *code = p->code;
 
     for (;;) {
@@ -885,6 +897,10 @@ static void vm_run(VM *vm, int entry) {
         case OP_ASSERT:
             vm_note(vm, NOTE_ASSERT, a, b);
             if (pop(vm) == 0.0) {
+                if (g_searching)
+                    fatal(3, "hunch: assertion failed at line %d, column %d\n"
+                          "  in step %d of a continuation the search was trying, not in the "
+                          "episode itself", a, b, (int)vm->s->step);
                 if (g_trace_on && vm->s->step == 0)
                     fatal(3, "hunch: assertion failed at line %d, column %d\n"
                           "  in init, in the episode with seed %llu", a, b,
@@ -982,6 +998,11 @@ static void vm_run(VM *vm, int entry) {
             if (legal == 0) hunch_fail(vm, agent, NULL, -1);
             int at_random = (int)((vm->random_agents >> agent) & 1u);
             Net *net = at_random ? NULL : vm->nets[agent];
+            /* A search has no probabilities until it has run, and it runs
+             * only if the choice is left to the policy: a driver's `decide`
+             * is shown uniform ones. */
+            struct Search *search = at_random ? NULL : vm->search;
+            int searched = 0;
             Decision *d = NULL;
             if (vm->record && vm->n_dec < MAX_DEC_PER_STEP &&
                 (vm->record_agent < 0 || vm->record_agent == agent)) {
@@ -1079,6 +1100,13 @@ static void vm_run(VM *vm, int entry) {
                 if (!((legal >> action) & 1u)) hunch_fail(vm, agent, asked, action);
             } else if (action >= 0) {
                 /* forced, and legal here */
+            } else if (search) {
+                /* The draw above is the only one taken from the world's
+                 * stream: the search has its own, started from the instant. */
+                vm->at_ip = ip;
+                action = search_choose(search, vm, ip, agent, n_act, legal);
+                for (int i = 0; i < n_act; i++) probs[i] = i == action ? 1.0 : 0.0;
+                searched = 1;
             } else if (!net && !by_table) {
                 /* Uniform: the k-th legal action. */
                 int k = (int)(u * mask_count(legal, n_act));
@@ -1109,6 +1137,10 @@ static void vm_run(VM *vm, int entry) {
                 d->value = value;
                 d->logp = log(probs[action] > 1e-12 ? probs[action] : 1e-12);
                 memcpy(d->prob, probs, sizeof(double) * (size_t)n_act);
+                if (searched) {
+                    d->searched = 1;
+                    search_found(search, d->tries, d->mean);
+                }
                 vm->n_dec++;
             }
             push(vm, (double)action);
@@ -1191,6 +1223,19 @@ static void vm_run(VM *vm, int entry) {
 done:
     vm->sp = 0;
     vm->csp = 0;
+}
+
+static void vm_run(VM *vm, int entry) {
+    vm->sp = 0;
+    vm->csp = 0;
+    vm->halt = 0;
+    vm->insns = 0;
+    vm->stopped = 0;
+    /* A block cut off by the instruction budget between OP_LEGAL and its
+     * OP_HUNCH must not leave its mask for the next block's first decision. */
+    vm->legal_pending = 0;
+    vm->in_init = entry == vm->p->init_entry;
+    vm_exec(vm, entry);
 }
 
 static void state_reset(const Program *p, State *s, uint64_t seed) {
@@ -2171,7 +2216,14 @@ static void trace_episode(const Program *p, Net **nets, uint64_t seed, int horiz
                 if (a) fputc(',', out);
                 json_num(out, d->prob[a]);
             }
-            fputs("]}", out);
+            fputs("]", out);
+            if (d->searched) {
+                /* chosen by a search: how many playouts tried each action */
+                fputs(",\"tries\":[", out);
+                for (int a = 0; a < d->n_act; a++) fprintf(out, "%s%d", a ? "," : "", d->tries[a]);
+                fputs("]", out);
+            }
+            fputs("}", out);
         }
         fputs("]", out);
         if (asking) {
@@ -2182,6 +2234,13 @@ static void trace_episode(const Program *p, Net **nets, uint64_t seed, int horiz
         }
 
         if (want_forks && nets) {
+            /* Kept now: the branches below reuse vm->dec. */
+            Decision found[MAX_DEC_PER_STEP];
+            int searched[MAX_DEC_PER_STEP];
+            for (int k = 0; k < vm->n_dec; k++) {
+                searched[k] = vm->dec[k].searched;
+                if (searched[k]) found[k] = vm->dec[k];
+            }
             fputs(",\"q\":{", out);
             int wrote = 0;
             for (int k = 0; k < vm->n_dec; k++) {
@@ -2198,6 +2257,15 @@ static void trace_episode(const Program *p, Net **nets, uint64_t seed, int horiz
                     /* An illegal action has no value to measure; null keeps
                      * the array aligned with the action numbers. */
                     if (!((legal >> a) & 1u)) { fputs("null", out); continue; }
+                    if (searched[k]) {
+                        /* A search has measured this already: the mean of
+                         * what the playouts that tried the action saw.
+                         * Replaying the episode with a search in every seat
+                         * would take minutes for each number. */
+                        if (found[k].tries[a] > 0) json_num(out, found[k].mean[a]);
+                        else fputs("null", out);
+                        continue;
+                    }
                     double q = fork_rollout(vm, &snap, agent, a, NULL, 0);
                     if (vm->force_missed) fputs("null", out);
                     else json_num(out, q);
@@ -2248,12 +2316,505 @@ static int has_flag(int argc, char **argv, const char *flag) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Policies: a network per agent, or one table                         */
+/* Search: a policy that forks the world at each decision              */
+/* ------------------------------------------------------------------ */
+
+/* A world too big to follow whole is searched where it stands. At a decision
+ * the instant is copied into the search's own VM and played on from there
+ * many times (Monte Carlo tree search, UCT): the first decisions of each
+ * playout are chosen by what earlier playouts found, the rest uniformly at
+ * random, and the action tried most is played. Each agent is taken to want
+ * its own return, so this serves one agent, two, or more.
+ *
+ * The copy is the running block itself, stopped after the decision: state,
+ * stack, calls and instruction counter. The search's VM continues it with an
+ * action pushed, so the VM that asked is never touched, and no block is run
+ * twice.
+ *
+ * It reads the whole state. Where an agent is shown less than that, the
+ * search knows more than its agent should; `hidden` records what `train`
+ * found out about that.
+ *
+ * It is deterministic. Its random numbers come from a stream started from
+ * the instant searched (random stream included), and the world's own stream
+ * is not drawn from, so an episode replays exactly. */
+
+#define SEARCH_MAX_NODES 1000000L   /* positions one search remembers; playouts past that add none */
+
+enum { HIDDEN_NOTHING = 0, HIDDEN_FOUND, HIDDEN_UNKNOWN };
+
+typedef struct {
+    uint64_t h1, h2;    /* the instant, as two independent hashes */
+    int agent, n_act;
+    uint32_t legal;
+    int visits;
+    long stat;          /* its first entry in `tries` and `total` */
+} SNode;
+
+typedef struct { long node; int action; double before; } SPath;
+
+typedef struct Search {
+    Driver dr;          /* first, so a Driver * is a Search * */
+    const Program *p;
+    int playouts;       /* per decision */
+    double explore;     /* how readily a less-tried action is tried again */
+    int hidden;         /* HIDDEN_*: what train's check said of this world */
+    int horizon;
+    VM vm;              /* its own: the VM that asked is left as it was */
+    State st, root;
+    double root_stack[STACK_SIZE], root_scratch[MAX_SCRATCH];
+    int root_calls[CALL_DEPTH];
+    SNode *nodes;
+    long nn, cap;
+    int width;          /* entries of `tries` and `total` per node */
+    int *tries;
+    double *total;
+    long *slot, nslot;
+    SPath *path;
+    int npath, cappath;
+    int rollout;        /* this playout has left the positions remembered */
+    double paid[MAX_AGENTS];    /* in the blocks of this playout that have ended */
+    double low, high;   /* the least and the most any decision has gone on to collect */
+    uint64_t rng[4];
+    /* what the last search found at its root */
+    int found_n, found_tries[MAX_ACT];
+    double found_mean[MAX_ACT];
+    /* train measures how fast this world is searched: with `slice` set a
+     * search stops after that many seconds. Never set in play, where the
+     * count alone decides, so that play does not depend on the machine. */
+    double slice;
+    double cost;        /* seconds a playout took, summed over the searches timed */
+    long played, searches;
+    /* what train's check of the world saw (see shown_check), kept in the file */
+    long checked[4];
+} Search;
+
+/* The instant a VM stands at, asked a decision: who is asked, the step, where
+ * in the block, the stack and the calls it is inside, and every slot of the
+ * world's memory. What the block has paid so far is left out: it is the same
+ * position whatever was collected on the way to it. */
+static void search_key(const VM *vm, int agent, uint64_t *h1, uint64_t *h2) {
+    uint64_t a = mix64(0x5EA4C4ULL + (uint64_t)agent, (uint64_t)vm->s->step);
+    a = mix64(a, (uint64_t)vm->at_ip * 2 + (uint64_t)(vm->in_init != 0));
+    a = mix64(a, (uint64_t)vm->sp * 1024 + (uint64_t)vm->csp);
+    uint64_t b = a ^ 0xD1B54A32D192ED03ULL;
+#define SEARCH_MIX(x) do { uint64_t x_ = (x); a = mix64(a, x_); \
+        b = (rotl64(b, 23) ^ x_) * 0x9FB21C651E98DF25ULL; } while (0)
+    for (int i = 0; i < vm->sp; i++) SEARCH_MIX(bits_of(vm->stack[i]));
+    for (int i = 0; i < vm->csp; i++) SEARCH_MIX((uint64_t)vm->call_ip[i]);
+    const double *v = vm->s->v;
+    for (int i = 0, n = vm->p->nslots; i < n; i++) SEARCH_MIX(bits_of(v[i]));
+#undef SEARCH_MIX
+    *h1 = a;
+    *h2 = b ^ (b >> 31);
+}
+
+static Search *search_new(const Program *p, int playouts, double explore, int hidden) {
+    Search *S = (Search *)xcalloc(1, sizeof(Search));
+    S->p = p;
+    S->playouts = playouts < 1 ? 1 : playouts;
+    S->explore = explore;
+    S->hidden = hidden;
+    S->horizon = p->horizon;
+    return S;
+}
+
+static void search_free(Search *S) {
+    if (!S) return;
+    free(S->nodes); free(S->tries); free(S->total); free(S->slot); free(S->path);
+    free(S);
+}
+
+/* The node for an instant, added if there is room. -1: no room, or a node
+ * that does not fit what is asked here. */
+static long search_node(Search *S, uint64_t h1, uint64_t h2, int agent, int n_act,
+                        uint32_t legal, int *fresh) {
+    long at = (long)(h1 & (uint64_t)(S->nslot - 1));
+    *fresh = 0;
+    for (;;) {
+        long id = S->slot[at];
+        if (id < 0) break;
+        const SNode *n = &S->nodes[id];
+        if (n->h1 == h1 && n->h2 == h2)
+            return n->agent == agent && n->n_act == n_act && n->legal == legal ? id : -1;
+        at = (at + 1) & (S->nslot - 1);
+    }
+    if (S->nn >= S->cap) return -1;
+    long id = S->nn++;
+    SNode *n = &S->nodes[id];
+    n->h1 = h1; n->h2 = h2;
+    n->agent = agent; n->n_act = n_act; n->legal = legal;
+    n->visits = 0;
+    n->stat = id * S->width;
+    memset(S->tries + n->stat, 0, sizeof(int) * (size_t)n_act);
+    memset(S->total + n->stat, 0, sizeof(double) * (size_t)n_act);
+    S->slot[at] = id;
+    *fresh = 1;
+    return id;
+}
+
+/* UCB1 over a node's legal actions, with values scaled to the range seen so
+ * far. An action not yet tried goes first, picked at random among those. */
+static int search_pick(Search *S, long id) {
+    const SNode *n = &S->nodes[id];
+    const int *tries = S->tries + n->stat;
+    const double *total = S->total + n->stat;
+    int untried = 0;
+    for (int a = 0; a < n->n_act; a++)
+        if (((n->legal >> a) & 1u) && tries[a] == 0) untried++;
+    if (untried) {
+        int k = (int)(rng_double(S->rng) * untried);
+        for (int a = 0; a < n->n_act; a++)
+            if (((n->legal >> a) & 1u) && tries[a] == 0 && k-- == 0) return a;
+    }
+    double span = S->high > S->low ? S->high - S->low : 1.0;
+    double log_n = log((double)n->visits + 1.0);
+    int best = -1;
+    double best_score = 0.0;
+    for (int a = 0; a < n->n_act; a++) {
+        if (!((n->legal >> a) & 1u)) continue;
+        double score = (total[a] / tries[a] - S->low) / span +
+                       S->explore * sqrt(log_n / tries[a]);
+        if (best < 0 || score > best_score) { best = a; best_score = score; }
+    }
+    return best;
+}
+
+static void search_step_in(Search *S, long id, int action, double before) {
+    if (S->npath >= S->cappath) {
+        S->cappath = S->cappath ? S->cappath * 2 : 256;
+        S->path = (SPath *)xrealloc(S->path, sizeof(SPath) * (size_t)S->cappath);
+    }
+    S->path[S->npath].node = id;
+    S->path[S->npath].action = action;
+    S->path[S->npath].before = before;
+    S->npath++;
+}
+
+/* Every decision of a playout after the first comes here. */
+static int search_decide(Driver *dr, VM *vm, int agent, const double *obs, int obs_len,
+                         int n_act, uint32_t legal, const double *probs) {
+    Search *S = (Search *)dr;
+    (void)obs; (void)obs_len; (void)probs;
+    /* Past the remembered positions play is uniform, drawn by the VM from
+     * the playout's own stream. */
+    if (S->rollout) return DRIVE_PASS;
+    uint64_t h1, h2;
+    int fresh;
+    search_key(vm, agent, &h1, &h2);
+    long id = search_node(S, h1, h2, agent, n_act, legal, &fresh);
+    if (id < 0) { S->rollout = 1; return DRIVE_PASS; }
+    int action = search_pick(S, id);
+    /* What init pays is dropped by the runtime, so it is not counted here. */
+    search_step_in(S, id, action, S->paid[agent] + (vm->in_init ? 0.0 : vm->agent_reward[agent]));
+    if (fresh) S->rollout = 1;
+    return action;
+}
+
+/* Called by a VM in the middle of a block, at a decision of `agent`: `ip` is
+ * the instruction after it. Returns the action to play. */
+static int search_choose(Search *S, VM *vm, int ip, int agent, int n_act, uint32_t legal) {
+    const Program *p = S->p;
+    double t0 = S->slice > 0 ? now_sec() : 0.0;
+    size_t state_bytes = offsetof(State, v) + sizeof(double) * (size_t)p->nslots;
+    if (!S->nodes) {
+        S->cap = (long)S->playouts + 1;
+        if (S->cap > SEARCH_MAX_NODES) S->cap = SEARCH_MAX_NODES;
+        for (int i = 0; i < p->nagents; i++)
+            if (p->agents[i].n_act > S->width) S->width = p->agents[i].n_act;
+        if (S->width < n_act) S->width = n_act;
+        S->nslot = 64;
+        while (S->nslot < S->cap * 2) S->nslot *= 2;
+        S->nodes = (SNode *)xmalloc(sizeof(SNode) * (size_t)S->cap);
+        S->tries = (int *)xmalloc(sizeof(int) * (size_t)S->cap * (size_t)S->width);
+        S->total = (double *)xmalloc(sizeof(double) * (size_t)S->cap * (size_t)S->width);
+        S->slot = (long *)xmalloc(sizeof(long) * (size_t)S->nslot);
+        vm_init(&S->vm, p, &S->st);
+        S->dr.decide = search_decide;
+    }
+    if (n_act > S->width) fatal(2, "hunch: a decision with more actions than its agent declares");
+
+    /* the instant: everything the rest of the block and the episode depend on */
+    memcpy(&S->root, vm->s, state_bytes);
+    memcpy(S->root_stack, vm->stack, sizeof(double) * (size_t)vm->sp);
+    memcpy(S->root_calls, vm->call_ip, sizeof(int) * (size_t)vm->csp);
+    memcpy(S->root_scratch, vm->scratch, sizeof(vm->scratch));
+    int sp = vm->sp, csp = vm->csp, in_init = vm->in_init;
+    long insns = vm->insns;
+
+    S->nn = 0;
+    for (long i = 0; i < S->nslot; i++) S->slot[i] = -1;
+    S->low = HUGE_VAL;
+    S->high = -HUGE_VAL;
+    uint64_t h1, h2;
+    int fresh;
+    search_key(vm, agent, &h1, &h2);
+    long root = search_node(S, h1, h2, agent, n_act, legal, &fresh);
+    /* Its own stream, from the instant and the world's stream as it stands:
+     * the same instant is searched the same way, wherever and whenever. */
+    uint64_t seed = mix64(h1, h2);
+    for (int i = 0; i < 4; i++) seed = mix64(seed, vm->s->rng[i]);
+    rng_seed(S->rng, seed);
+
+    VM *sv = &S->vm;
+    int ran = 0;
+    g_searching = 1;
+    for (int n = 0; n < S->playouts; n++, ran++) {
+        if (S->slice > 0 && (n & 15) == 15 && now_sec() - t0 >= S->slice) break;
+        memcpy(&S->st, &S->root, state_bytes);
+        /* chance from here on is drawn afresh in every playout */
+        rng_seed(S->st.rng, rng_next(S->rng));
+        memcpy(sv->stack, S->root_stack, sizeof(double) * (size_t)sp);
+        memcpy(sv->call_ip, S->root_calls, sizeof(int) * (size_t)csp);
+        memcpy(sv->scratch, S->root_scratch, sizeof(sv->scratch));
+        sv->sp = sp;
+        sv->csp = csp;
+        sv->insns = insns;
+        sv->in_init = in_init;
+        sv->halt = 0;
+        sv->stopped = 0;
+        sv->legal_pending = 0;
+        sv->driver = &S->dr;
+        memset(sv->agent_reward, 0, sizeof(sv->agent_reward));
+        memset(S->paid, 0, sizeof(S->paid));
+        S->npath = 0;
+        S->rollout = 0;
+
+        int first = search_pick(S, root);
+        search_step_in(S, root, first, 0.0);
+        push(sv, (double)first);
+        vm_exec(sv, ip);                /* the rest of the block the decision is in */
+        if (!in_init)
+            for (int a = 0; a < p->nagents; a++) S->paid[a] += sv->agent_reward[a];
+        while (!S->st.done && S->st.step < S->horizon) {
+            vm_step(sv);
+            for (int a = 0; a < p->nagents; a++) S->paid[a] += sv->agent_reward[a];
+        }
+
+        for (int k = 0; k < S->npath; k++) {
+            SNode *nd = &S->nodes[S->path[k].node];
+            double v = S->paid[nd->agent] - S->path[k].before;
+            if (v < S->low) S->low = v;
+            if (v > S->high) S->high = v;
+            nd->visits++;
+            S->tries[nd->stat + S->path[k].action]++;
+            S->total[nd->stat + S->path[k].action] += v;
+        }
+        S->played++;
+    }
+    g_searching = 0;
+    S->searches++;
+
+    /* the action tried most; between equals the one that did better, then the first */
+    const SNode *nd = &S->nodes[root];
+    int best = -1;
+    S->found_n = n_act;
+    for (int a = 0; a < n_act; a++) {
+        int t = S->tries[nd->stat + a];
+        S->found_tries[a] = t;
+        S->found_mean[a] = t ? S->total[nd->stat + a] / t : 0.0;
+        if (!((legal >> a) & 1u)) continue;
+        if (best < 0 || t > S->found_tries[best] ||
+            (t == S->found_tries[best] && S->found_mean[a] > S->found_mean[best]))
+            best = a;
+    }
+    if (S->slice > 0 && ran > 0) S->cost += (now_sec() - t0) / ran;
+    return best;
+}
+
+/* What the search just run found: how often each action was tried at the
+ * decision, and the mean of what its agent went on to collect. */
+static void search_found(const Search *S, int *tries, double *mean) {
+    memcpy(tries, S->found_tries, sizeof(int) * (size_t)S->found_n);
+    memcpy(mean, S->found_mean, sizeof(double) * (size_t)S->found_n);
+}
+
+
+static const char *const HIDDEN_NAME[] = { "nothing", "found", "unknown" };
+
+static void save_search(const char *path, const Program *p, const Search *S) {
+    FILE *f = fopen(path, "w");
+    if (!f) fatal(1, "hunch-vm: cannot write %s: %s", path, strerror(errno));
+    fprintf(f, "HUNCHSEARCH 1\nworld %s\nplayouts %d\nexplore %.9g\nhidden %s\n"
+            "checked %ld %ld %ld %ld\n", p->world, S->playouts, S->explore,
+            HIDDEN_NAME[S->hidden], S->checked[0], S->checked[1], S->checked[2], S->checked[3]);
+    fclose(f);
+}
+
+/* The rest of a HUNCHSEARCH file, after its first line. */
+static Search *load_search(FILE *f, const Program *p) {
+    char tag[64], word[64];
+    int playouts = 0, hidden = HIDDEN_UNKNOWN;
+    double explore = 1.0;
+    long checked[4] = {0, 0, 0, 0};
+    if (fscanf(f, "%63s %63s", tag, word) != 2) return NULL;
+    /* A search made for another world would run, and mean something else. */
+    if (strcmp(tag, "world") != 0 || strcmp(word, p->world) != 0) return NULL;
+    while (fscanf(f, "%63s", tag) == 1) {
+        if (strcmp(tag, "playouts") == 0) {
+            if (fscanf(f, "%d", &playouts) != 1) return NULL;
+        } else if (strcmp(tag, "explore") == 0) {
+            if (fscanf(f, "%lf", &explore) != 1) return NULL;
+        } else if (strcmp(tag, "hidden") == 0) {
+            if (fscanf(f, "%63s", word) != 1) return NULL;
+            hidden = -1;
+            for (int k = 0; k < 3; k++)
+                if (strcmp(word, HIDDEN_NAME[k]) == 0) hidden = k;
+            if (hidden < 0) return NULL;
+        } else if (strcmp(tag, "checked") == 0) {
+            if (fscanf(f, "%ld %ld %ld %ld", &checked[0], &checked[1], &checked[2],
+                       &checked[3]) != 4) return NULL;
+        } else {
+            return NULL;
+        }
+    }
+    if (playouts < 1 || !(explore >= 0.0) || explore > 1e6) return NULL;
+    Search *S = search_new(p, playouts, explore, hidden);
+    memcpy(S->checked, checked, sizeof(checked));
+    return S;
+}
+
+/* ---- is anything hidden from the agents? ---- */
+
+/* A search reads the whole state, so it is a fair policy only where each
+ * agent is shown everything. The exact graph can prove that; a world too big
+ * for the graph is tested by sampling instead. Random episodes are played,
+ * and at every decision what the agent is shown (the agent, its observation
+ * and which actions are legal) is noted against the instant it was shown in:
+ * every slot of the world's memory, the step number, and the place in the
+ * block (the same things a search tells positions apart by).
+ *
+ * - The same thing shown in two different instants, even once: something is
+ *   hidden (HIDDEN_FOUND). The step number counts, so an agent that is not
+ *   shown how far the episode has run is an agent with something hidden.
+ * - Nothing is hidden (HIDDEN_NOTHING) only on evidence: at least
+ *   SHOWN_MIN_REPEATS sampled positions showed something seen before, they
+ *   were at least SHOWN_MIN_SHARE of all sampled positions, at least
+ *   SHOWN_MIN_DISTINCT different things were shown more than once, and every
+ *   one of those repeats was in the instant it had been in before.
+ * - Otherwise nothing can be said (HIDDEN_UNKNOWN): observations that are
+ *   measurements never repeat, and prove nothing. The share and the number
+ *   of different things keep an opening that is the same in every episode
+ *   (one thing shown, repeated thousands of times) from counting as evidence.
+ *
+ * It is evidence, not proof: random play repeats mostly the positions near
+ * the start, so a world that hides something only where random play never
+ * shows the same thing twice would pass. */
+#define SHOWN_POSITIONS    40000L   /* decisions sampled */
+#define SHOWN_EPISODES     20000L   /* or this many episodes */
+#define SHOWN_SECONDS      3.0      /* or this long */
+#define SHOWN_MIN_REPEATS  1000L
+#define SHOWN_MIN_SHARE    0.05
+#define SHOWN_MIN_DISTINCT 50L
+
+typedef struct {
+    Driver dr;          /* first, so a Driver * is a Shown * */
+    long nslot;         /* a power of two */
+    uint64_t *key, *i1, *i2;
+    unsigned char *seen;        /* 0 empty, 1 shown once, 2 shown again */
+    long positions, repeats, distinct, conflicts, episodes;
+} Shown;
+
+static int shown_decide(Driver *dr, VM *vm, int agent, const double *obs, int obs_len,
+                        int n_act, uint32_t legal, const double *probs) {
+    Shown *W = (Shown *)dr;
+    (void)n_act; (void)probs;
+    if (W->positions >= SHOWN_POSITIONS) return DRIVE_PASS;
+    uint64_t h = tab_hash(agent, obs, obs_len, legal), h1, h2;
+    search_key(vm, agent, &h1, &h2);
+    W->positions++;
+    long at = (long)(h & (uint64_t)(W->nslot - 1));
+    while (W->seen[at] && W->key[at] != h) at = (at + 1) & (W->nslot - 1);
+    if (!W->seen[at]) {
+        W->seen[at] = 1;
+        W->key[at] = h;
+        W->i1[at] = h1;
+        W->i2[at] = h2;
+        return DRIVE_PASS;
+    }
+    W->repeats++;
+    if (W->seen[at] == 1) { W->seen[at] = 2; W->distinct++; }
+    if (W->i1[at] != h1 || W->i2[at] != h2) W->conflicts++;
+    return DRIVE_PASS;
+}
+
+/* Sample the world with uniform random play. Returns HIDDEN_*; `out` gets
+ * positions sampled, repeats, different things shown more than once, and
+ * repeats in a different instant. */
+static int shown_check(const Program *p, int horizon, uint64_t seed, long out[4]) {
+    Shown W;
+    memset(&W, 0, sizeof(W));
+    W.dr.decide = shown_decide;
+    W.nslot = 1;
+    while (W.nslot < SHOWN_POSITIONS * 2) W.nslot *= 2;
+    W.key = (uint64_t *)xmalloc(sizeof(uint64_t) * (size_t)W.nslot);
+    W.i1 = (uint64_t *)xmalloc(sizeof(uint64_t) * (size_t)W.nslot);
+    W.i2 = (uint64_t *)xmalloc(sizeof(uint64_t) * (size_t)W.nslot);
+    W.seen = (unsigned char *)xcalloc((size_t)W.nslot, 1);
+    State *s = (State *)xmalloc(sizeof(State));
+    VM *vm = (VM *)xmalloc(sizeof(VM));
+    vm_init(vm, p, s);
+    vm->driver = &W.dr;
+    double t0 = now_sec();
+    while (W.positions < SHOWN_POSITIONS && W.episodes < SHOWN_EPISODES &&
+           now_sec() - t0 < SHOWN_SECONDS) {
+        run_episode(vm, NULL, NULL, mix64(seed + 0x5407ULL, (uint64_t)W.episodes), 0,
+                    (int)W.episodes, NULL, horizon);
+        W.episodes++;
+    }
+    out[0] = W.positions; out[1] = W.repeats; out[2] = W.distinct; out[3] = W.conflicts;
+    free(W.key); free(W.i1); free(W.i2); free(W.seen); free(vm); free(s);
+    if (W.conflicts > 0) return HIDDEN_FOUND;
+    if (W.repeats >= SHOWN_MIN_REPEATS && W.distinct >= SHOWN_MIN_DISTINCT &&
+        (double)W.repeats >= SHOWN_MIN_SHARE * (double)W.positions)
+        return HIDDEN_NOTHING;
+    return HIDDEN_UNKNOWN;
+}
+
+/* How many playouts a second a search of this world gets through on this
+ * machine: episodes are played by a search that is given `slice` seconds at
+ * each decision, until `searches` decisions have been searched or `budget`
+ * seconds have gone. 0 if no decision was reached.
+ *
+ * A playout from late in an episode is short and one from its start is long,
+ * so the figure is taken per decision: the time a playout took at each
+ * decision searched, averaged over the decisions, and turned over. A search
+ * that makes that many playouts at every decision then takes a second on
+ * average, more near the start of an episode and less near its end. It
+ * covers the decisions of the first episode or two; an episode much longer
+ * than `searches` decisions is measured at its start only. */
+static double search_measure(const Program *p, int horizon, double explore, uint64_t seed,
+                             double slice, int searches, double budget) {
+    Search *M = search_new(p, 100000, explore, HIDDEN_UNKNOWN);
+    M->horizon = horizon;
+    M->slice = slice;
+    State *s = (State *)xmalloc(sizeof(State));
+    VM *vm = (VM *)xmalloc(sizeof(VM));
+    vm_init(vm, p, s);
+    vm->search = M;
+    double t0 = now_sec();
+    for (uint64_t e = 0; M->searches < searches && now_sec() - t0 < budget; e++) {
+        state_reset(p, s, seed + e * 7919ULL);
+        s->ep = 0;
+        vm_run(vm, p->init_entry);
+        while (!s->done && s->step < horizon && M->searches < searches &&
+               now_sec() - t0 < budget)
+            vm_step(vm);
+    }
+    double rate = M->cost > 0 ? (double)M->searches / M->cost : 0.0;
+    free(vm); free(s);
+    search_free(M);
+    return rate;
+}
+
+/* ------------------------------------------------------------------ */
+/* Policies: a network per agent, one table, or a search               */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
     Net *nets[MAX_AGENTS];
     Table *tab;
+    Search *search;
 } Policy;
 
 static void save_table(const char *path, const Program *p, const Table *T) {
@@ -2301,7 +2862,7 @@ static Table *load_table(FILE *f, const Program *p) {
     return T;
 }
 
-/* Read a policy file of either kind. 1 on success. */
+/* Read a policy file of any kind. 1 on success. */
 static int policy_load(const char *path, const Program *p, Policy *pol) {
     FILE *f = fopen(path, "r");
     if (!f) return 0;
@@ -2312,6 +2873,11 @@ static int policy_load(const char *path, const Program *p, Policy *pol) {
         pol->tab = load_table(f, p);
         fclose(f);
         return pol->tab != NULL;
+    }
+    if (strcmp(tag, "HUNCHSEARCH") == 0) {
+        pol->search = version == 1 ? load_search(f, p) : NULL;
+        fclose(f);
+        return pol->search != NULL;
     }
     fclose(f);
     for (int i = 0; i < p->nagents; i++)
@@ -2325,11 +2891,13 @@ static void policy_attach(VM *vm, const Policy *pol) {
     vm->tab = pol ? pol->tab : NULL;
     vm->tab_mode = vm->tab ? TAB_AVERAGE : TAB_OFF;
     vm->tab_create = 0;
+    vm->search = pol ? pol->search : NULL;
 }
 
 static void policy_free(Policy *pol) {
     for (int i = 0; i < MAX_AGENTS; i++) net_free(pol->nets[i]);
     tab_free(pol->tab);
+    search_free(pol->search);
 }
 
 /* ------------------------------------------------------------------ */
@@ -3065,8 +3633,116 @@ static void report_rows(FILE *f, const Table *I, const double *share, const doub
     free(rank);
 }
 
+/* Counts the actions taken, for the report of a search. */
+typedef struct { Driver dr; double freq[MAX_AGENTS * MAX_ACT]; } Tally;
+
+static void tally_decided(Driver *dr, VM *vm, int agent, int n_act, uint32_t legal,
+                          const double *probs, int action) {
+    (void)vm; (void)n_act; (void)legal; (void)probs;
+    ((Tally *)dr)->freq[agent * MAX_ACT + action] += 1.0;
+}
+
+/* Episodes on the stream eval_any uses, until `max_episodes` have been played
+ * or the time is `until`: at least one, and one that has begun is finished.
+ * Returns how many. */
+static int eval_until(const Program *p, const Policy *pol, uint32_t random_agents,
+                      Driver *driver, int max_episodes, double until, uint64_t seed,
+                      int horizon, Eval *out) {
+    State *s = (State *)xmalloc(sizeof(State));
+    VM *vm = (VM *)xmalloc(sizeof(VM));
+    vm_init(vm, p, s);
+    policy_attach(vm, pol);
+    vm->random_agents = random_agents;
+    vm->driver = driver;
+    double sum[MAX_AGENTS] = {0}, sq[MAX_AGENTS] = {0}, ret[MAX_AGENTS];
+    int n = 0;
+    while (n < max_episodes && (n == 0 || now_sec() < until)) {
+        run_episode(vm, NULL, NULL, seed + (uint64_t)n * 7919ULL, 0, n, ret, horizon);
+        for (int a = 0; a < p->nagents; a++) { sum[a] += ret[a]; sq[a] += ret[a] * ret[a]; }
+        n++;
+    }
+    memset(out, 0, sizeof(*out));
+    for (int a = 0; a < p->nagents; a++) {
+        double m = sum[a] / (double)n;
+        double var = sq[a] / (double)n - m * m;
+        out->mean[a] = m;
+        out->sem[a] = n > 1 && var > 0 ? sqrt(var / (double)(n - 1)) : 0.0;
+    }
+    free(vm); free(s);
+    return n;
+}
+
+/* A search cannot be weighed over every outcome: each of its decisions is
+ * thousands of playouts, and it has no table to read. It is sampled, and
+ * since an episode of it takes seconds, for a set time (--score-sec, 15 s
+ * unless said): a share for every agent searching, and a share for each
+ * agent searching against the others playing uniformly at random. Every
+ * measurement plays at least one episode and finishes the one it is in, so a
+ * world with long episodes overruns. */
+static int report_search(const Program *p, const Policy *pol, int horizon, uint64_t seed,
+                         int argc, char **argv) {
+    const Search *S = pol->search;
+    int nag = p->nagents;
+    int episodes = (int)arg_long(argc, argv, "--episodes", 4000);
+    double seconds = arg_double(argc, argv, "--score-sec", 15.0);
+    if (episodes < 1) episodes = 1;
+    FILE *f = stdout;
+    double t0 = now_sec();
+    int parts = nag > 1 ? nag + 1 : 1;
+    Tally tally;
+    memset(&tally, 0, sizeof(tally));
+    tally.dr.decided = tally_decided;
+    Eval ev, rnd, vs;
+    eval_any(p, NULL, mask_all(nag), NULL, 4000, seed, horizon, &rnd);
+    /* Each measurement ends at its own mark, so one that overruns takes the
+     * time from the next and the whole stays near what was asked. With no
+     * limit (0) the episode count alone decides. */
+    double never = t0 + 1e9;
+    int n_all = eval_until(p, pol, 0, &tally.dr, episodes,
+                           seconds > 0 ? t0 + seconds / parts : never, seed, horizon, &ev);
+    double vsm[MAX_AGENTS] = {0}, vss[MAX_AGENTS] = {0};
+    int vsn[MAX_AGENTS] = {0};
+    for (int a = 0; a < nag && nag > 1; a++) {
+        vsn[a] = eval_until(p, pol, mask_all(nag) & ~((uint32_t)1 << a), NULL, episodes,
+                            seconds > 0 ? t0 + seconds * (a + 2) / parts : never, seed,
+                            horizon, &vs);
+        vsm[a] = vs.mean[a];
+        vss[a] = vs.sem[a];
+    }
+    fputs("{\"world\":", f);
+    json_str(f, p->world);
+    fprintf(f, ",\"horizon\":%d,\"exact\":false,\"why\":\"search\",\"limit\":0,", horizon);
+    fprintf(f, "\"search\":{\"playouts\":%d,\"explore\":%.9g,\"hidden\":\"%s\","
+            "\"positions\":%ld,\"repeats\":%ld,\"distinct\":%ld,\"conflicts\":%ld},",
+            S->playouts, S->explore, HIDDEN_NAME[S->hidden], S->checked[0], S->checked[1],
+            S->checked[2], S->checked[3]);
+    fprintf(f, "\"episodes\":%d,\"score_sec\":%.9g,", n_all, seconds);
+    fputs("\"return\":", f); json_vec(f, ev.mean, nag);
+    fputs(",\"sem\":", f); json_vec(f, ev.sem, nag);
+    fputs(",\"random\":", f); json_vec(f, rnd.mean, nag);
+    fputs(",\"random_sem\":", f); json_vec(f, rnd.sem, nag);
+    fputs(",\"random_episodes\":4000", f);
+    fputs(",\"vs_random\":", f); json_vec(f, vsm, nag);
+    fputs(",\"vs_random_sem\":", f); json_vec(f, vss, nag);
+    fputs(",\"vs_random_episodes\":[", f);
+    for (int a = 0; a < nag; a++) fprintf(f, "%s%d", a ? "," : "", vsn[a]);
+    /* A search keeps no table, so there are no situations to list. */
+    fputs("],\"decisions\":0,\"unseen\":0,\"listed_all\":true,\"situations\":0,"
+          "\"situations_by_agent\":[", f);
+    for (int g = 0; g < MAX_AGENTS; g++) fprintf(f, "%s0", g ? "," : "");
+    fputs("],\"rows\":[],\"freq\":[", f);
+    for (int a = 0; a < nag; a++) {
+        if (a) fputc(',', f);
+        for (int k = 0; k < MAX_ACT; k++) tally.freq[a * MAX_ACT + k] /= (double)n_all;
+        json_vec(f, tally.freq + a * MAX_ACT, p->agents[a].n_act);
+    }
+    fprintf(f, "],\"sec\":%.3f}\n", now_sec() - t0);
+    return 0;
+}
+
 static int cmd_report(const Program *p, const Policy *pol, int horizon, uint64_t seed,
                       int argc, char **argv) {
+    if (pol->search) return report_search(p, pol, horizon, seed, argc, argv);
     long max_nodes = arg_long(argc, argv, "--exact-nodes", 2000000);
     int episodes = (int)arg_long(argc, argv, "--episodes", 4000);
     int max_rows = (int)arg_long(argc, argv, "--rows", 400);
@@ -3208,10 +3884,73 @@ static int cmd_report(const Program *p, const Policy *pol, int horizon, uint64_t
  * the episode is played on to its end. `samples` continuations are tried, the
  * same ones for every action, so two actions are compared on the same luck.
  * The first continuation is the one that really happened. */
+/* Why, for a search. Replaying each decision once per action, hundreds of
+ * times, with a search in every seat of every continuation would take hours.
+ * The search has already done the comparing: the episode is played once, and
+ * for each decision this says how many playouts tried each action and the
+ * mean of what its agent collected in them, from that instant to the end. In
+ * a playout the first moves are the search's and the rest are random, so a
+ * mean is the search's estimate, not what the action is worth against it. */
+static int why_search(const Program *p, const Policy *pol, int horizon, uint64_t seed,
+                      int only) {
+    State *s = (State *)xmalloc(sizeof(State));
+    VM *vm = (VM *)xmalloc(sizeof(VM));
+    vm_init(vm, p, s);
+    policy_attach(vm, pol);
+    state_reset(p, s, seed);
+    s->ep = 0;
+    vm_run(vm, p->init_entry);
+    memset(vm->agent_reward, 0, sizeof(vm->agent_reward));
+    FILE *f = stdout;
+    double total[MAX_AGENTS] = {0};
+    fputs("{\"world\":", f);
+    json_str(f, p->world);
+    fprintf(f, ",\"seed\":%llu,\"search\":{\"playouts\":%d,\"explore\":%.9g,"
+            "\"hidden\":\"%s\"},\"decisions\":[", (unsigned long long)seed,
+            pol->search->playouts, pol->search->explore, HIDDEN_NAME[pol->search->hidden]);
+    int first = 1;
+    for (int t = 0; t < horizon && !s->done; t++) {
+        vm->record = 1;
+        vm_step(vm);
+        vm->record = 0;
+        for (int a = 0; a < p->nagents; a++) total[a] += vm->agent_reward[a];
+        if (only > 0 && only != t + 1) continue;
+        for (int k = 0; k < vm->n_dec; k++) {
+            const Decision *d = &vm->dec[k];
+            fprintf(f, "%s{\"step\":%d,\"index\":%d,\"agent\":%d,\"action\":%d,\"legal\":%u,"
+                    "\"obs\":", first ? "" : ",", t + 1, k, d->agent, d->action, d->mask);
+            first = 0;
+            fputc('[', f);
+            for (int i = 0; i < d->obs_dim; i++) {
+                if (i) fputc(',', f);
+                json_num(f, d->obs[i]);
+            }
+            fputs("],\"probs\":", f);
+            json_vec(f, d->prob, d->n_act);
+            fputs(",\"tries\":[", f);
+            for (int a = 0; a < d->n_act; a++) fprintf(f, "%s%d", a ? "," : "", d->tries[a]);
+            /* null: illegal, or legal and never tried (fewer playouts than actions) */
+            fputs("],\"value\":[", f);
+            for (int a = 0; a < d->n_act; a++) {
+                if (a) fputc(',', f);
+                if (d->tries[a] > 0) fprintf(f, "%.9g", d->mean[a]);
+                else fputs("null", f);
+            }
+            fputs("]}", f);
+        }
+    }
+    fputs("],\"returns\":", f);
+    json_vec(f, total, p->nagents);
+    fputs("}\n", f);
+    free(vm); free(s);
+    return 0;
+}
+
 static int cmd_why(const Program *p, const Policy *pol, int horizon, uint64_t seed,
                    int argc, char **argv) {
     int samples = (int)arg_long(argc, argv, "--samples", 200);
     int only = (int)arg_long(argc, argv, "--step", 0);
+    if (pol->search) return why_search(p, pol, horizon, seed, only);
     if (samples < 1) samples = 1;
     State s, bs;
     VM vm, bvm;
@@ -3821,9 +4560,10 @@ static void usage(void) {
     fprintf(stderr,
         "usage: hunch-vm <command> <program.hbc> [options]\n"
         "\n"
-        "  train <prog> [--algo random|reinforce|ppo|fork|regret] [--budget N] [--seed S]\n"
+        "  train <prog> [--algo random|reinforce|ppo|fork|regret|mcts] [--budget N] [--seed S]\n"
         "               [--out policy.hpol] [--eval-episodes N] [--json]\n"
-        "  report <prog> [--policy p.hpol] [--episodes N] [--exact-nodes N]\n"
+        "               [--think SECONDS | --playouts N]   (mcts: playouts a decision)\n"
+        "  report <prog> [--policy p.hpol] [--episodes N] [--exact-nodes N] [--score-sec S]\n"
         "               (what the policy does and collects, as one JSON object)\n"
         "  why   <prog> [--policy p.hpol] [--seed S] [--samples N] [--step K]\n"
         "  trace <prog> [--policy p.hpol] [--seed S] [--forks] [--out file.json]\n"
@@ -4074,6 +4814,7 @@ void *hunch_env_new(void *world, int n, uint32_t outside, const char *policy, in
             longjmp(g_trap, 1);
         }
         policy_attach(&e->vm, &e->pol);
+        if (e->pol.search) e->pol.search->horizon = e->horizon;
     }
     e->dr.dr.decide = env_decide;
     e->dr.dr.decided = env_decided;
@@ -4240,7 +4981,10 @@ int hunch_env_playout(void *env, int i, double *out) {
     return 0;
 }
 
-/* What the environment's policy does where `agent` is shown `obs`. */
+/* What the environment's policy does where `agent` is shown `obs`: 1, or 0
+ * for a situation it has no answer for (uniform). -1: no legal action. -2:
+ * the policy is a search, which chooses from an instant of the world, not
+ * from what an agent is shown, and so has no answer to this question. */
 int hunch_env_policy_probs(void *env, int agent, const double *obs, uint32_t legal,
                            double *out) {
     HunchEnv *e = (HunchEnv *)env;
@@ -4249,6 +4993,13 @@ int hunch_env_policy_probs(void *env, int agent, const double *obs, uint32_t leg
     int n = p->agents[agent].n_act, dim = p->agents[agent].obs_dim;
     legal &= mask_all(n);
     if (!legal) return -1;
+    if (e->pol.search) {
+        snprintf(e->err, sizeof(e->err),
+                 "this policy is a search: it chooses by forking the world at the instant of "
+                 "a decision, not from what the agent is shown, so it has no probabilities "
+                 "for an observation. Play it in an environment to see what it does");
+        return -2;
+    }
     if (e->pol.tab) {
         long row = tab_find(e->pol.tab, agent, obs, dim, n, legal, 0);
         if (row < 0) { probs_uniform(out, n, legal); return 0; }
@@ -4426,9 +5177,14 @@ int main(int argc, char **argv) {
         long positions = 0;
         char not_whole[64] = "";
         int proven = 0;
+        int hidden = -1;            /* HIDDEN_*, once the world has been checked */
+        long checked[4] = {0, 0, 0, 0};
+        int playouts = 0;
+        double playouts_sec = 0.0, think = 0.0, explore = 0.0;
         /* auto: the exact answer when the world is small enough to follow
-         * whole; failing that, a network for one agent and sampled regret
-         * matching for several. */
+         * whole; failing that, a search at play time when sampling finds
+         * nothing hidden from the agents; failing that, a network for one
+         * agent and sampled regret matching for several. */
         int is_auto = strcmp(algo, "auto") == 0;
         if (is_auto) algo = "regret";
         if (strcmp(algo, "regret") == 0) {
@@ -4484,7 +5240,13 @@ int main(int argc, char **argv) {
                 snprintf(not_whole, sizeof(not_whole), "rand:%d:%d", T->rand_line, T->rand_col);
             else if (!T) snprintf(not_whole, sizeof(not_whole), "off");
             else if (!whole) snprintf(not_whole, sizeof(not_whole), "big:%ld", max_nodes);
-            if (!whole && is_auto && p.nagents == 1) algo = "ppo";
+            if (!whole && is_auto) {
+                /* A search reads the whole state, so it is chosen only on
+                 * evidence that the agents are shown all of it. */
+                hidden = shown_check(&p, horizon, seed, checked);
+                if (hidden == HIDDEN_NOTHING) algo = "mcts";
+            }
+            if (!whole && is_auto && p.nagents == 1 && hidden != HIDDEN_NOTHING) algo = "ppo";
             if (!whole && strcmp(algo, "regret") == 0 && !arg_value(argc, argv, "--budget", NULL))
                 cfg.budget = 2000000;
             if (whole) {
@@ -4499,6 +5261,32 @@ int main(int argc, char **argv) {
         }
         if (whole) {
             /* done above */
+        } else if (strcmp(algo, "mcts") == 0) {
+            /* Nothing is learned ahead of play. What is settled here is how
+             * many playouts a decision gets: this world's playouts a second
+             * are measured on this machine, and the count that fills --think
+             * seconds (a tenth by default) is written to the file, so the
+             * policy plays the same on any machine. --playouts sets it. */
+            if (hidden < 0) hidden = shown_check(&p, horizon, seed, checked);
+            explore = arg_double(argc, argv, "--explore", 1.0);
+            think = arg_double(argc, argv, "--think", 0.1);
+            if (!(think > 0.0)) think = 0.1;
+            if (!(explore >= 0.0)) explore = 1.0;
+            playouts_sec = search_measure(&p, horizon, explore, seed, 0.02, 48, 1.0);
+            playouts = (int)arg_long(argc, argv, "--playouts", 0);
+            if (playouts < 1) {
+                double want = playouts_sec > 0 ? playouts_sec * think : 1000.0;
+                /* two figures are all the measurement is good for */
+                double unit = pow(10.0, floor(log10(want > 10.0 ? want : 10.0)) - 1.0);
+                want = floor(want / unit + 0.5) * unit;
+                playouts = want < 16.0 ? 16 : want > 5e7 ? 50000000 : (int)want;
+            }
+            Search *S = search_new(&p, playouts, explore, hidden);
+            memcpy(S->checked, checked, sizeof(checked));
+            if (outpath) save_search(outpath, &p, S);
+            search_free(S);
+            steps = 0;
+            final_ret = 0.0;        /* not measured: see the report */
         } else if (strcmp(algo, "regret") == 0) {
             Policy pol;
             memset(&pol, 0, sizeof(pol));
@@ -4523,9 +5311,23 @@ int main(int argc, char **argv) {
         if (has_flag(argc, argv, "--json")) {
             printf("{\"algo\":\"%s\",\"seed\":%llu,\"budget\":%ld,", algo,
                    (unsigned long long)seed, cfg.budget);
-            printf("\"steps_used\":%.0f,\"wall_sec\":%.3f,\"final_return\":%.9g",
-                   steps, wall, final_ret);
+            printf("\"steps_used\":%.0f,\"wall_sec\":%.3f,", steps, wall);
+            /* A search is scored by the report, not here. */
+            if (strcmp(algo, "mcts") == 0) printf("\"final_return\":null");
+            else printf("\"final_return\":%.9g", final_ret);
             if (not_whole[0]) printf(",\"not_whole\":\"%s\"", not_whole);
+            if (hidden >= 0)
+                printf(",\"hidden\":\"%s\",\"hidden_check\":{\"positions\":%ld,\"repeats\":%ld,"
+                       "\"distinct\":%ld,\"conflicts\":%ld,\"min_repeats\":%ld,"
+                       "\"min_share\":%.9g,\"min_distinct\":%ld}", HIDDEN_NAME[hidden],
+                       checked[0], checked[1], checked[2], checked[3], SHOWN_MIN_REPEATS,
+                       SHOWN_MIN_SHARE, SHOWN_MIN_DISTINCT);
+            if (strcmp(algo, "mcts") == 0)
+                printf(",\"method\":\"mcts\",\"chosen\":%s,\"playouts\":%d,"
+                       "\"playouts_per_sec\":%.0f,\"think\":%.9g,\"playouts_set\":%s,"
+                       "\"explore\":%.9g", is_auto ? "true" : "false", playouts, playouts_sec,
+                       think, arg_long(argc, argv, "--playouts", 0) >= 1 ? "true" : "false",
+                       explore);
             if (whole == 3) printf(",\"proven\":%s", proven ? "true" : "false");
             if (strcmp(algo, "regret") == 0)
                 printf(",\"method\":\"%s\",\"iterations\":%ld,\"situations\":%ld,"
@@ -4558,6 +5360,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "hunch-vm: could not read policy %s\n", polpath);
             return 1;
         }
+        if (pol.search) pol.search->horizon = horizon;
         int rc = strcmp(cmd, "why") == 0
             ? cmd_why(&p, &pol, horizon, seed, argc, argv)
             : cmd_report(&p, &pol, horizon, seed, argc, argv);
@@ -4626,6 +5429,8 @@ int main(int argc, char **argv) {
             vm.ask = has_flag(argc, argv, "--ask");
             vm.tab = pol.tab;
             vm.tab_mode = pol.tab ? TAB_AVERAGE : TAB_OFF;
+            vm.search = pol.search;
+            if (pol.search) pol.search->horizon = horizon;
             trace_episode(&p, nets, seed + (uint64_t)e * 7919ULL, horizon, out,
                           want_forks, &vm, &s);
         }
@@ -4638,6 +5443,28 @@ int main(int argc, char **argv) {
     }
 
     if (strcmp(cmd, "eval") == 0 || strcmp(cmd, "speed") == 0) {
+        /* A search is not networks: the first agent's mean return with every
+         * agent searching, on the episodes the other kinds are scored on.
+         * Every decision is a whole search, so ask for few episodes. */
+        Policy spol;
+        memset(&spol, 0, sizeof(spol));
+        if (polpath && policy_load(polpath, &p, &spol) && spol.search) {
+            int episodes = (int)arg_long(argc, argv, "--episodes", cfg.eval_episodes);
+            spol.search->horizon = horizon;
+            Eval ev;
+            double t0 = now_sec();
+            eval_any(&p, &spol, 0, NULL, episodes, seed, horizon, &ev);
+            double wall = now_sec() - t0;
+            if (strcmp(cmd, "speed") == 0)
+                printf("{\"episodes\":%d,\"wall_sec\":%.4f,\"return\":%.6f,\n"
+                       "\"episodes_per_sec\":%.1f,\"steps_per_sec\":%.0f}\n", episodes, wall,
+                       ev.mean[0], (double)episodes / wall, (double)episodes * horizon / wall);
+            else
+                printf("{\"episodes\":%d,\"return\":%.9g}\n", episodes, ev.mean[0]);
+            policy_free(&spol);
+            return 0;
+        }
+        policy_free(&spol);
         Net *nets[MAX_AGENTS];
         for (int i = 0; i < MAX_AGENTS; i++) nets[i] = NULL;
         for (int i = 0; i < p.nagents; i++)

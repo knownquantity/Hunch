@@ -8,8 +8,9 @@
 // a draw. An action is the column, 0 to 6 from the left.
 //
 // The board has about 4.5 trillion positions: far too many to solve by
-// following every one, so `hunch train` falls back to sampling here. It is in
-// this folder to show the other way to use a world: fork it and search.
+// following every one. Nothing is hidden from the players, so `hunch train`
+// makes the policy a search: at each move it forks the world and tries every
+// column many times.
 
 world ConnectFour
 
