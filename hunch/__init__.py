@@ -1,6 +1,6 @@
 """Hunch: write the rules of a world, leave the decisions blank."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 from .world import Env, Grade, HunchRuntimeError, Policy, Trained, VecEnv, World  # noqa: E402,F401
 from .search import Search  # noqa: E402,F401
