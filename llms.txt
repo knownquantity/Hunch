@@ -448,7 +448,7 @@ Only the values after "sees" were given to the agent.
 
 ## From Python
 
-`pip install git+https://github.com/knownquantity/Hunch`, or put a checkout on
+`pip install hunch-lang`, or put a checkout on
 `sys.path`. The core needs only the standard library and a C compiler; numpy,
 gymnasium and pettingzoo are imported only by the calls that use them. An
 installed Hunch builds its runtime into `~/.cache/hunch` on first use (set

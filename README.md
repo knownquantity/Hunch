@@ -88,7 +88,7 @@ That is the textbook answer. The game is worth −1/18 to the first player. Alic
 You need `python3` and a C compiler. From a checkout, `./bin/hunch` works with nothing installed. To get the `hunch` command and `import hunch` anywhere:
 
 ```bash
-pip install git+https://github.com/knownquantity/Hunch
+pip install hunch-lang
 hunch train kuhn          # the worlds in worlds/ ship with it, by name
 ```
 
