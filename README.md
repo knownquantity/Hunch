@@ -8,7 +8,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/knownquantity/Hunch" alt="license" height="22"></a>
 </h1>
 
-**Hunch** is a small language for reinforcement-learning environments and games. You write the rules of a world and what is rewarded, and leave a `hunch(...)` blank wherever a decision is made. `hunch train` fills the blanks, and then tells you what it found: what each agent collects, whether anything better exists, and what the policy does.
+**Hunch** is a self-play-native programming language for RL environments. You write the rules of a world and what is rewarded, and leave a `hunch(...)` blank wherever a decision is made. `hunch train` fills the blanks, and then tells you what it found: what each agent collects, whether anything better exists, and what the policy does.
 
 A world is one file. This is all of Kuhn poker, the smallest game in which bluffing is correct:
 
@@ -152,10 +152,10 @@ Measured after the default ten minutes of self-play on 4 cores, playing on one c
 |---|---|---|
 | Connect Four, the search without a network, from the usual empty board | won 46, drew 1, lost 3 of 50 | won 48, lost 2 of 50 |
 | the same, from 50 random openings of four discs | won 27, drew 2, lost 21 of 50 | won 37, drew 2, lost 11 of 50 |
-| four-in-a-row on a 5×4 board, perfect play (the best result is a draw) | drew 100 of 100 | drew 100 of 100 |
+| four-in-a-row on a 5×4 board ([`worlds/four.hunch`](worlds/four.hunch)), perfect play (the best result is a draw) | drew 100 of 100 | drew 100 of 100 |
 | four-in-a-row on a 5×5 board, perfect play (a draw) | drew 100 of 100 | drew 96, lost 4 of 100 |
 
-The perfect player picks at random among the moves that keep the game's exact value, so the games differ. Without the network, at the same time a move, the search drew 25 of 100 as the first player on the 5×4 board and lost the rest, to a trap that closes fifteen moves after its mistake; on the 5×5 board it drew 74 and 67. `--games 0` gives you that search, with no training.
+The perfect player picks at random among the moves that keep the game's exact value, so the games differ. The 5×4 row is one command to check: [`python3 examples/perfect_play.py`](examples/perfect_play.py) has Hunch solve that board outright, train on it the ordinary way, and play the two against each other (about a quarter of an hour, 3.6 GB). The 5×5 board is past what Hunch solves; its perfect player was a separate solver that is not in this repository. Without the network, at the same time a move, the search drew 25 of 100 as the first player on the 5×4 board and lost the rest, to a trap that closes fifteen moves after its mistake; on the 5×5 board it drew 74 and 67. `--games 0` gives you that search, with no training.
 
 Strength grew with self-play and then levelled off. From the random openings on Connect Four, against the search without a network, in runs at 3,000 playouts a move (about 0.105 s): 64 games of self-play won 38 of 100, one minute on 4 cores 58, ten minutes on one core 64, ten minutes on 4 cores 69, and thirty minutes on 4 cores 65. A second training run with another seed won 75 of 100 from the empty board and 63 from the openings. Nothing here is proven beyond the games played, and Connect Four has not been measured against perfect play.
 

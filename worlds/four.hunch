@@ -1,0 +1,66 @@
+// Four in a row on a small board: five columns, four rows, nothing hidden.
+//   ./bin/hunch train worlds/four.hunch
+//   ./bin/hunch play  worlds/four.hunch
+//   python3 examples/perfect_play.py        how the trained policy does against perfect play
+//
+// Connect Four's rules on a board small enough to check. Players take turns
+// dropping a disc into a column that is not full; it falls to the lowest
+// empty row. The first to line up four of their own discs in a row, a column
+// or a diagonal wins +1 and the other gets -1. A full board is a draw. An
+// action is the column, 0 to 4 from the left.
+//
+// The board has 4,220,375 positions: past what `hunch train` follows whole by
+// default (two million), so the policy is a search that learns by playing
+// itself. It is also small enough to solve when asked
+// (`--exact-nodes 6000000`, about two minutes and 3.6 GB), and with best play
+// by both the game is a draw. That makes it a yardstick: a policy trained the
+// ordinary way can be played against perfect play.
+
+world Four
+
+horizon 20
+
+state {
+  board: int[20] wide 5 up;   // 0 empty, 1 x's disc, 2 o's; cell = row * 5 + column,
+                              // row 0 at the bottom. `wide 5 up` is how it is printed.
+  height: int[5];             // discs in each column
+  turn: int = 1;              // whose move: 1 x, 2 o
+  placed: int = 0;
+}
+
+// The disc at (column, row), or 0 off the board.
+fn at(c, r) {
+  if c < 0 || c > 4 || r < 0 || r > 3 { return 0; }
+  return board[r * 5 + c];
+}
+
+// How long the line through (c, r) in direction (dc, dr) is, counting (c, r).
+fn run(c, r, dc, dr) {
+  let n = 0;
+  let who = at(c, r);
+  let i = 1;
+  while i < 4 && at(c + i * dc, r + i * dr) == who { n = n + 1; i = i + 1; }
+  i = 1;
+  while i < 4 && at(c - i * dc, r - i * dr) == who { n = n + 1; i = i + 1; }
+  return n + 1;
+}
+
+step {
+  let can: int[5];
+  for c in 0..5 { if height[c] < 4 { can[c] = 1; } }
+  let m = 0;
+  if turn == 1 { m = hunch x(board, 5, can); } else { m = hunch o(board, 5, can); }
+
+  let r = height[m];
+  assert r < 4;
+  board[r * 5 + m] = turn;
+  height[m] = r + 1;
+  placed = placed + 1;
+
+  if run(m, r, 1, 0) >= 4 || run(m, r, 0, 1) >= 4 || run(m, r, 1, 1) >= 4 || run(m, r, 1, -1) >= 4 {
+    if turn == 1 { reward(x, 1); reward(o, -1); } else { reward(x, -1); reward(o, 1); }
+    done();
+  }
+  if placed == 20 { done(); }
+  turn = 3 - turn;
+}
