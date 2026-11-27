@@ -303,6 +303,11 @@ def cmd_run(args) -> int:
             print()
         print(f"{trace['world']}, seed {ep['seed']}, {policy_words(policy)}")
         print("\n".join(show.episode_lines(trace, ep, names, scripted=scripted)))
+    if names.agents:
+        # A trace is the referee's view. Said once, because a world with
+        # hidden cards prints them here.
+        print("\nthis is the whole state, including what the agents are not shown; "
+              "\"sees\" is all an agent was given")
     return 0
 
 
@@ -640,6 +645,13 @@ def cmd_test(args) -> int:
     totals = [sum(sum(step["r"].values()) for step in ep["steps"])
               for ep in report["episodes"]]
     mean = sum(totals) / len(totals) if totals else 0.0
+    # With several agents the total says little (it is zero in any zero-sum
+    # game), so each agent's own mean is what gets printed.
+    each = {name: 0.0 for name in unit["agents"]}
+    for ep in report["episodes"]:
+        for step in ep["steps"]:
+            for name, r in step["r"].items():
+                each[name] = each.get(name, 0.0) + r
     # --strict makes the runtime say what actually executed, as one JSON line
     # on stderr. Counting the asserts in the source would call an assertion
     # "held" when the episodes never reached it.
@@ -662,9 +674,12 @@ def cmd_test(args) -> int:
     else:
         # Do not imply a check that never ran.
         verdict = "no assertions in this world, so nothing was checked"
-    whose = "mean reward" if len(unit["agents"]) < 2 else "mean reward over all agents"
-    print(f"{path}: {len(totals)} episode(s), {verdict}, "
-          f"{whose} {mean:+.3f}")
+    if len(unit["agents"]) < 2 or not totals:
+        rewards = f"mean reward {mean:+.3f}"
+    else:
+        rewards = "mean reward with untrained play: " + ", ".join(
+            f"{name} {total / len(totals):+.3f}" for name, total in each.items())
+    print(f"{path}: {len(totals)} episode(s), {verdict}, {rewards}")
     # The language defines these (clamp the index, yield 0), so they are not
     # failures. They are reported because they usually mean a bug in the world.
     for note in sorted(notes, key=lambda n: (n["line"], n["col"], n["kind"])):

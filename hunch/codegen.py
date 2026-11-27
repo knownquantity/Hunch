@@ -8,6 +8,7 @@ can be snapshotted with a single memcpy.
 
 from __future__ import annotations
 
+import re
 import struct
 from typing import Dict, List, Optional, Tuple
 
@@ -143,6 +144,14 @@ class CodeGen:
         # What `hunch run`, `why` and `play` print instead of bare numbers.
         self.agent_action_names: Dict[str, List[str]] = {}
         self.agent_obs_labels: Dict[str, List[str]] = {}
+        # What was last put in each element of a local array, as source text,
+        # so that an observation built in one is named by what it holds and
+        # not `obs[0]`, `obs[1]`. Keyed by the array's first slot.
+        self.array_texts: Dict[int, List[str]] = {}
+        # Loops over a fixed range that are being compiled: variable -> range.
+        self.loop_ranges: Dict[str, range] = {}
+        # State arrays printed as rows: name -> [values in a row, first row at the bottom].
+        self.grids: Dict[str, List[int]] = {}
 
         self.func_index: Dict[str, int] = {
             fn.name: i for i, fn in enumerate(prog.funcs)
@@ -302,6 +311,7 @@ class CodeGen:
             "agent_acts": self.agent_acts,
             "agent_action_names": self.agent_action_names,
             "agent_obs_labels": self.agent_obs_labels,
+            "grids": self.grids,
             "decls": self.decls,
             "funcs": {name: self.func_info[name] for name in self.func_order()},
             "init_entry": self.init_entry,
@@ -335,6 +345,11 @@ class CodeGen:
             self.var_slots[v.name] = (base, n)
             self.scopes[0][v.name] = base
             self.decls.append((v.name, base, n, 1 if v.type_name in ("int", "bool") else 0))
+            if v.wide:
+                if rec is not None:
+                    raise self.err(f"'wide' is for an array of numbers, and '{v.name}' holds "
+                                   "records", v)
+                self.grids[v.name] = [v.wide, 1 if v.up else 0]
 
             block = [0.0] * n
             if v.default is not None:
@@ -436,6 +451,10 @@ class CodeGen:
         if isinstance(node, Let):
             if node.array_len > 0:
                 base = self.declare_array(node.name, node.array_len, node)
+                self.array_texts[base] = [""] * node.array_len
+                if isinstance(node.value, ArrayLit) and \
+                        len(node.value.texts) == node.array_len:
+                    self.array_texts[base] = list(node.value.texts)
                 if node.value is not None:
                     if not isinstance(node.value, ArrayLit):
                         raise self.err(
@@ -491,6 +510,7 @@ class CodeGen:
                 return
             if isinstance(node.target, Index):
                 base, n = self.arr_slots(node.target.base, node)
+                self.note_element(base, n, node)
                 self.expr(node.value)
                 self.expr(node.target.index)
                 self.emit(STORE_IDX, base, n, self.pos(node.target))
@@ -545,6 +565,11 @@ class CodeGen:
             return
 
         if isinstance(node, For):
+            lo, hi = _literal(node.start), _literal(node.end)
+            fixed = (lo is not None and hi is not None and lo == int(lo) and hi == int(hi)
+                     and 0 <= hi - lo <= MAX_OBS)
+            if fixed:
+                self.loop_ranges[node.var] = range(int(lo), int(hi))
             self.push_scope()
             i_slot = self.declare(node.var, node)
             end_slot = self.alloc(1, node)
@@ -567,6 +592,7 @@ class CodeGen:
             self.emit(JUMP, loop_start)
             self.patch(j_false, self.here)
             self.pop_scope()
+            self.loop_ranges.pop(node.var, None)
             return
 
         if isinstance(node, Return):
@@ -601,6 +627,26 @@ class CodeGen:
             return
 
         raise self.err(f"unsupported statement {type(node).__name__}", node)
+
+    def note_element(self, base: int, n: int, node: Assign) -> None:
+        """Remember the source text put in an element of a local array: at a
+        literal index, or at the variable of a loop over a fixed range (then
+        once per turn of the loop, with the variable's value written in)."""
+        texts = self.array_texts.get(base)
+        if texts is None or not node.value_text:
+            return
+        index = node.target.index
+        k = _literal(index)
+        if k is not None and k == int(k):
+            put = [(int(k), node.value_text)]
+        elif isinstance(index, Name) and index.name in self.loop_ranges:
+            word = re.compile(r"\b%s\b" % re.escape(index.name))
+            put = [(i, word.sub(str(i), node.value_text)) for i in self.loop_ranges[index.name]]
+        else:
+            return
+        for i, text in put:
+            if 0 <= i < n and text not in texts[i].split(" | "):
+                texts[i] = f"{texts[i]} | {text}" if texts[i] else text
 
     def record_of(self, node: Node, name: str) -> Tuple[int, int, int, str]:
         if name not in self.var_records:
@@ -806,7 +852,9 @@ class CodeGen:
                 for i in range(n):
                     self.emit(PUSH_VAR, base + i)
                 obs_len = n
-                labels = [f"{node.obs}[{i}]" for i in range(n)]
+                # A local array is named by what was put in it, where that is known.
+                texts = self.array_texts.get(base) or [""] * n
+                labels = [texts[i] or f"{node.obs}[{i}]" for i in range(n)]
             else:
                 self.expr(Name(line=node.line, name=node.obs))
                 obs_len = 1
@@ -836,8 +884,9 @@ class CodeGen:
         # passes something else in a slot makes that slot's label "a | b".
         seen = self.agent_obs_labels.setdefault(node.agent, labels)
         for i, label in enumerate(labels):
-            if label and label not in seen[i].split(" | "):
-                seen[i] = f"{seen[i]} | {label}" if seen[i] else label
+            for part in label.split(" | "):
+                if part and part not in seen[i].split(" | "):
+                    seen[i] = f"{seen[i]} | {part}" if seen[i] else part
         if node.action_names is not None:
             prev_names = self.agent_action_names.get(node.agent)
             if prev_names is not None and prev_names != node.action_names:

@@ -17,7 +17,7 @@ anything better exists, and what the policy does.
 ## File shape
 
 ```
-world Name                    // optional label
+world Name                    // optional label: one word, no spaces
 record Slot { key: int; }     // a named group of fields, before 'state' 
 horizon 50                    // optional: max steps per episode (default 100)
 param rate = 0.1;             // compile-time constant, overridable from the CLI
@@ -45,6 +45,14 @@ Comments are `//` to end of line. Statements end with `;`.
     }
 
 `grid = [1,1,1, 1,0,1];` in `init` fills an array from literals.
+
+A board reads better as rows. `wide N` after a state array's size says how to
+print it, and changes nothing else about it:
+
+    board: int[9] wide 3;       // three rows of three, the first row on top
+    board: int[42] wide 7 up;   // rows of seven, the first row at the bottom (pieces fall)
+
+`hunch play` and `hunch run` then show it as a grid, with `.` for a zero.
 
 ## Statements
 
@@ -191,7 +199,10 @@ know, such as the opponent's card.
 Use whole numbers for things that are whole numbers: `[card, pot]`, not
 `[card / 3.0, pot / 10.0]`. Exact solving and regret matching keep one table
 row per distinct observation, and the report prints the table under the
-expressions you wrote. Scale to roughly [-1, 1] only in worlds that will be
+expressions you wrote. An observation built in a local array is named by what
+you put in each element: after `obs[0] = pile;` or
+`for i in 0..9 { obs[i] = shown[i]; }` the columns are `pile` and `shown[0]`
+to `shown[8]`. Scale to roughly [-1, 1] only in worlds that will be
 trained with a neural network (`--algo ppo`), where the values are
 measurements.
 
@@ -234,10 +245,65 @@ step {
 `hunch train` reports that the best any policy can collect is +0.92, eight
 steps right, and that the policy it found does so.
 
-A two-agent world with hidden information, simultaneous moves, or turns is the
-same thing with two names. `worlds/kuhn.hunch` is the shortest complete
-example: a deal in `init`, a `phase` variable for whose turn it is, and
-`reward(alice, ...)`, `reward(bob, ...)`, `done()` at the end of a hand.
+## A complete world with two agents
+
+Two names are two agents. This one has turns, a deal, and something hidden:
+alice sees a coin and says what it is, truthfully or not; bob hears only what
+she says and guesses the coin. A right guess of heads pays him double.
+
+```
+world Coin
+horizon 2
+
+state {
+  coin: int = 0;      // alice's secret: 0 tails, 1 heads
+  said: int = 0;      // what alice claimed
+  turn: int = 0;      // whose move: 0 alice, 1 bob
+}
+
+init {
+  coin = randint(0, 1);
+}
+
+step {
+  if turn == 0 {
+    said = hunch alice([coin], [say_tails, say_heads]);   // alice is shown the coin
+    turn = 1;
+  } else {
+    let guess = hunch bob([said], [tails, heads]);        // bob is shown only her claim
+    if guess == coin {
+      reward(bob, 1 + coin);                              // a right "heads" pays double
+      reward(alice, -1 - coin);
+    } else {
+      reward(bob, -1);
+      reward(alice, 1);
+    }
+    done();
+  }
+}
+```
+
+The pattern for any game with turns: a `turn` (or `phase`) variable in `state`,
+one `hunch` per branch, each agent's observation holding only what that agent
+may know, both sides paid, and `done()` at the end. `hunch train` reports that
+bob collects +0.5 an episode and guesses heads whatever alice says: her claim
+costs her nothing, so it tells him nothing. `worlds/kuhn.hunch` is the same
+shape with a bet in it.
+
+## Details the examples do not show
+
+- A world's name is one word: `world MineField`, not `world Mine Field`.
+- A statement ends with `;`. A block (`state`, `init`, `step`, `fn`, `if`,
+  `for`, `while`, `record`) does not.
+- A `let` can be assigned again later in the same block: `let n = 0; n = n + 1;`.
+- `init` takes the same statements as `step`: `let`, loops, `randint`, calls.
+- A `hunch` may sit inside an `if` or a loop, and its result may go into a
+  `let` or straight into `state`: `move = hunch x(board, 9, free);`.
+- An index is any expression, an action included: `board[move] = turn;`.
+- A `fn` reads and writes `state` directly, takes numbers, returns a number,
+  and can be called from `init`, `step` or another `fn`.
+- Two different draws out of nine: `let a = randint(0, 8);`
+  `let b = (a + 1 + randint(0, 7)) % 9;`.
 
 ## Designing a good world
 
@@ -346,17 +412,39 @@ of selected decisions once per action under the same random numbers),
   different histories and that matters: no better reply was found, but one is
   not ruled out. Putting what the agent should remember into its observation
   removes it.
+- "solved by regret matching" means solved to the target, not to zero: the
+  line about what each agent could gain says how far from an equilibrium the
+  policy is. "solved by looking ahead" is exact.
 - "positions" counts every point where something is decided or drawn, after
-  merging the ones with equal state at the start of the same step.
+  merging the ones with equal state at the start of the same step. It measures
+  the solver's work, not the game's distinct boards: the step number is part of
+  a position, so one arrangement reached at two different steps counts twice,
+  and a step with a draw and a decision counts once for each.
+- A "situation" is one distinct thing an agent can be shown: its observation
+  and which actions are legal. The tables have a row per situation, and the
+  count on the first line adds the agents together.
 - The table lists the situations an agent meets most and what it does in each.
   `-` marks an illegal action. `--rows N` lists more.
 
-`hunch why` prints two numbers per alternative action. "this episode" replays
-that exact instant, with hidden things as they were, as the mean of `--samples`
-continuations (default 200) with one standard error. "whenever shown this" is
-the exact value over every instant in which the agent is shown the same thing,
-which is the fair test of a policy that cannot see what is hidden; it is
-printed when the world can be followed whole.
+`hunch why` goes through an episode decision by decision:
+
+    step 2   bob plays heads
+             whenever shown this:  tails -0.500
+             this episode:         tails -3
+
+Each line lists the actions that were not taken, and each number is what that
+action collects less what the action taken collects, so a negative number
+means the other action was worse. "this episode" replays that exact instant,
+with hidden things as they were, as the mean of `--samples` continuations
+(default 200), with one standard error where what follows is not certain.
+"whenever shown this" is the exact value over every instant in which the agent
+is shown the same thing, which is the fair test of a policy that cannot see
+what is hidden; it is printed when the world can be followed whole.
+`--step K` shows one decision in full, the action taken included.
+
+`hunch run` prints an episode as a referee sees it: the `start` line and the
+line of changes under each step show the whole state, hidden things included.
+Only the values after "sees" were given to the agent.
 
 ## From Python
 
@@ -515,15 +603,16 @@ value)}` from the last call.
                        [--think SECONDS | --playouts N] [--score-sec S]   (a search policy)
                        [--train-sec S | --games N] [--cores N]   (its self-play)
     hunch score <file> [--policy p] [--score-sec S]   the report for a saved policy, without training
-    hunch run <file> [--seed N] [--episodes N] [--json]
+    hunch run <file> [--seed N] [--episodes N] [--policy p] [--json]
     hunch run <file> --agent hero --actions up,up,left   script one agent, by name or number;
                                        when the list runs out the policy takes over
-    hunch why <file> [--seed N] [--step K] [--samples N]
+    hunch why <file> [--seed N] [--step K] [--samples N] [--policy p]
     hunch play <file> [--as AGENT] [--seed N]
     hunch grade <file> [--agent A] (--cmd PROGRAM | --questions | --answers FILE)
                        [--policy p] [--timeout S] [--json]
     hunch studio [--port 8000]
 
+These are the options used most; `hunch <command> --help` lists all of them.
 `run`, `why`, `play` and `score` use the `.hpol` that `train` left beside the
 world. `--policy FILE` names another, and `--policy none` means random play.
 `--param name=value` overrides a `param` in any command that takes a file.

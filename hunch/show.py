@@ -67,10 +67,23 @@ def mixed(info: dict) -> str:
             "playout from it")
 
 
+def grid_lines(vals: list, wide: int, up: bool) -> List[str]:
+    """An array declared `wide N`, as rows of N: a zero is a dot, so that the
+    pieces on a board stand out. `up` puts the first row at the bottom."""
+    cells = ["." if v == 0 else plain(v) for v in vals]
+    width = max(len(c) for c in cells)
+    rows = [" ".join(c.rjust(width) for c in cells[i:i + wide])
+            for i in range(0, len(cells), wide)]
+    return rows[::-1] if up else rows
+
+
 class Names:
     """The world's own words for agents, actions and observation slots."""
 
     def __init__(self, unit: dict):
+        # state arrays declared `wide N [up]`: name -> (values in a row, first row at the bottom)
+        self.grids = {name: (int(g[0]), bool(g[1])) for name, g in unit.get("grids", {}).items()}
+        self.lens = {d[0]: int(d[2]) for d in unit.get("decls", [])}
         self.agents: List[str] = list(unit["agents"])
         self.acts = {}
         self.labels = {}
@@ -100,10 +113,48 @@ class Names:
     def obs(self, obs: list) -> str:
         return "[" + ", ".join(plain(v) for v in obs) + "]"
 
+    def obs_parts(self, agent: int, obs: list) -> list:
+        """What an agent is shown, as (label, values, grid) pieces: a state
+        array declared `wide N` and shown whole is one piece with its grid;
+        every other value is a piece of its own, with grid None."""
+        labels = self.labels[self.agents[agent]]
+        if len(labels) != len(obs):
+            return [("", [v], None) for v in obs]
+        parts, i = [], 0
+        while i < len(obs):
+            name = labels[i][:-3] if labels[i].endswith("[0]") else ""
+            n = self.lens.get(name, 0)
+            if name in self.grids and labels[i:i + n] == [f"{name}[{k}]" for k in range(n)]:
+                parts.append((name, obs[i:i + n], self.grids[name]))
+                i += n
+            else:
+                parts.append((labels[i], [obs[i]], None))
+                i += 1
+        return parts
+
+    def obs_short(self, agent: int, obs: list) -> str:
+        """One line for an episode: a grid is named, not listed; it is in the
+        state, and the line under each step says what changed in it."""
+        parts = self.obs_parts(agent, obs)
+        if not any(grid for _, _, grid in parts):
+            return self.obs(obs)
+        words = [label if grid else plain(vals[0]) for label, vals, grid in parts]
+        return words[0] if len(words) == 1 else "[" + ", ".join(words) + "]"
+
     def obs_labelled(self, agent: int, obs: list, indent: str = "        ") -> str:
         labels = self.labels[self.agents[agent]]
         if len(labels) != len(obs):
             return self.obs(obs)
+        pieces = self.obs_parts(agent, obs)
+        if any(grid for _, _, grid in pieces):
+            out = []
+            for label, vals, grid in pieces:
+                if grid:
+                    out.append(f"{indent}{label}")
+                    out.extend(f"{indent}  {row}" for row in grid_lines(vals, *grid))
+                else:
+                    out.append(f"{indent}{label} = {plain(vals[0])}")
+            return "\n" + "\n".join(out)
         parts = [f"{lab} = {plain(v)}" for lab, v in zip(labels, obs)]
         if sum(len(part) for part in parts) > 70:
             # too much for one line: one value a line, under the line that asked
@@ -451,7 +502,7 @@ def decision_text(d: dict, names: Names, by: str = "") -> str:
         how = f"searched: {d['tries'][d['action']]:,} of {sum(d['tries']):,} playouts tried it"
     else:
         how = pct(d["probs"][d["action"]])
-    return f"{name} sees {names.obs(d['obs'])}, plays {act} ({how})"
+    return f"{name} sees {names.obs_short(d['agent'], d['obs'])}, plays {act} ({how})"
 
 
 def episode_lines(trace: dict, ep: dict, names: Names,
@@ -494,6 +545,12 @@ def episode_lines(trace: dict, ep: dict, names: Names,
     n = len(ep["steps"])
     paid_out = ", ".join(f"{name} collected {num(v)}" for name, v in totals.items())
     out.append(f"ended after {n} step{'s' if n != 1 else ''}" + (f":  {paid_out}" if paid_out else ""))
+    # A board is easier to read than the list of changes that led to it.
+    for f in fields:
+        if f["name"] in names.grids and f["len"] == names.lens.get(f["name"]):
+            out.append(f"{f['name']} at the end:")
+            out.extend("  " + row for row in
+                       grid_lines(prev[f["base"]:f["base"] + f["len"]], *names.grids[f["name"]]))
     return out
 
 

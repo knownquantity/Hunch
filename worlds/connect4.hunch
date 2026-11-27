@@ -17,7 +17,8 @@ world ConnectFour
 horizon 42
 
 state {
-  board: int[42];     // 0 empty, 1 first's disc, 2 second's; cell = row * 7 + column, row 0 at the bottom
+  board: int[42] wide 7 up;   // 0 empty, 1 first's disc, 2 second's; cell = row * 7 + column,
+                              // row 0 at the bottom. `wide 7 up` is how it is printed.
   height: int[7];     // discs in each column
   open: int[7] = [1, 1, 1, 1, 1, 1, 1];
   turn: int = 1;      // whose move: 1 first, 2 second

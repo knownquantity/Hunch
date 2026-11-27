@@ -11,7 +11,7 @@ world TicTacToe
 horizon 9
 
 state {
-  board: int[9];      // 0 empty, 1 x, 2 o
+  board: int[9] wide 3;   // 0 empty, 1 x, 2 o; printed as three rows of three
   free: int[9] = [1, 1, 1, 1, 1, 1, 1, 1, 1];
   turn: int = 1;      // whose move: 1 x, 2 o
   placed: int = 0;

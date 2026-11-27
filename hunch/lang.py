@@ -253,6 +253,7 @@ class UnOp(Node):
 @dataclass
 class ArrayLit(Node):
     items: List[Node] = field(default_factory=list)
+    texts: List[str] = field(default_factory=list)   # source text of each item
 
 
 @dataclass
@@ -280,6 +281,7 @@ class Let(Node):
 class Assign(Node):
     target: Any = None   # str or Index
     value: Node = None   # type: ignore[assignment]
+    value_text: str = ""  # source text of the value
 
 
 @dataclass
@@ -349,6 +351,8 @@ class VarDecl(Node):
     type_name: str = "int"
     array_len: int = 0          # 0 means scalar
     default: Optional[Node] = None
+    wide: int = 0               # `wide N`: printed as rows of N; 0 means as a list
+    up: bool = False            # `wide N up`: the first row is printed at the bottom
 
 
 @dataclass
@@ -435,6 +439,10 @@ class Parser:
 
         if self.accept("KW", "world"):
             prog.world = self.expect_ident()
+            if self.cur.kind == "IDENT":
+                raise self.error(
+                    f"unexpected {self.cur.value!r}: a world's name is one word",
+                    hint=f"write `world {prog.world}{self.cur.value}`")
 
         while not self.at("EOF"):
             if self.accept("KW", "horizon"):
@@ -540,12 +548,30 @@ class Parser:
             if array_len <= 0:
                 raise self.error("array length must be positive")
             self.expect("OP", "]")
+        # `board: int[42] wide 7;` changes nothing about the array. It says how
+        # to print it: as rows of 7, the first row on top, or at the bottom
+        # with `up` (a board where pieces fall).
+        wide, up = 0, False
+        if self.cur.kind == "IDENT" and self.cur.value == "wide":
+            w_tok = self.advance()
+            if array_len == 0:
+                raise self.error("'wide' is for an array: it says how many values make a row",
+                                 w_tok)
+            n = self.expect("NUM")
+            wide = int(float(n.value))
+            if wide <= 0 or array_len % wide != 0:
+                raise self.error(
+                    f"'{tok.value}' has {array_len} values, which do not make rows of "
+                    f"{n.value}", n)
+            if self.cur.kind == "IDENT" and self.cur.value == "up":
+                self.advance()
+                up = True
         default = None
         if self.accept("OP", "="):
             default = self.parse_expr()
         self.expect("OP", ";")
         return VarDecl(line=tok.line, col=tok.col, name=tok.value, type_name=type_tok.value,
-                       array_len=array_len, default=default)
+                       array_len=array_len, default=default, wide=wide, up=up)
 
     def parse_fn(self) -> FuncDecl:
         tok = self.expect("KW", "fn")
@@ -679,9 +705,12 @@ class Parser:
             if (target is not None and isinstance(target, (Name, Index, Field))
                     and self.at("OP", "=")):
                 self.advance()
+                start = self.pos
                 val = self.parse_expr()
+                text = self.text_between(start, self.pos)
                 self.expect("OP", ";")
-                return Assign(line=tok.line, col=tok.col, target=target, value=val)
+                return Assign(line=tok.line, col=tok.col, target=target, value=val,
+                              value_text=text)
             self.pos = save
 
         expr = self.parse_expr()
@@ -788,13 +817,16 @@ class Parser:
         if tok.kind == "OP" and tok.value == "[":
             self.advance()
             items: List[Node] = []
+            texts: List[str] = []
             if not self.at("OP", "]"):
                 while True:
+                    start = self.pos
                     items.append(self.parse_expr())
+                    texts.append(self.text_between(start, self.pos))
                     if not self.accept("OP", ","):
                         break
             self.expect("OP", "]")
-            return ArrayLit(line=tok.line, col=tok.col, items=items)
+            return ArrayLit(line=tok.line, col=tok.col, items=items, texts=texts)
 
         if tok.kind == "IDENT":
             self.advance()

@@ -118,6 +118,7 @@ The parts that matter most:
 - **`assert cond;`** makes a world check its own rules. `hunch test` runs episodes with random play and reports which asserts ran, and any index that went out of range or division by zero.
 - **`randint(lo, hi)`** is chance the runtime can list, so worlds that use it can be solved exactly. `rand()` is a real number, and makes the world sample-only.
 - **Only `state` lasts between steps.** Every `let` starts each step at zero.
+- **`board: int[42] wide 7 up;`** prints a state array as a grid in `play` and `run`: rows of seven, and with `up` the first row at the bottom. It changes nothing else.
 
 Use whole numbers in observations when the thing observed is a whole number. A table policy keys on exactly what the agent is shown, and the report prints it under the names in your source.
 
@@ -159,7 +160,7 @@ Hunch began as an experiment in credit assignment: replay a decision once per ac
 │   └── studio_server.py          HTTP and JSON API behind the Studio
 ├── runtime/hunch_vm.c            the whole engine: VM, exact graph, regret matching, search and its self-play, MLP, PPO, fork; also built as a library
 ├── worlds/                       one .hunch file each
-├── examples/                     grade PPO, a program or a language model; search Connect Four
+├── examples/                     grade PPO, a program or a language model; play a trained policy against perfect play
 ├── policies/                     shipped trained policies for the Studio
 ├── benchmarks/                   the fork experiments and the cache baselines
 ├── tests/                        test_compiler.py, test_bindings.py, and fuzz_exact.py: exact answers against brute force
@@ -169,7 +170,7 @@ Hunch began as an experiment in credit assignment: replay a decision once per ac
 ```
 
 ```bash
-python3 tests/test_compiler.py            # 52 tests, about twenty seconds
+python3 tests/test_compiler.py            # 53 tests, about twenty seconds
 python3 tests/test_bindings.py            # the Python package; numpy, gymnasium and pettingzoo checks run when installed
 python3 tests/fuzz_exact.py               # 200 random worlds: exact answers against brute force
 ```

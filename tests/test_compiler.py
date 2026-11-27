@@ -1245,6 +1245,65 @@ def test_cli_test_shows_shape():
         assert out.returncode == 2 and "invalid choice" in out.stderr, out.stderr
 
 
+def test_reference_page_worlds():
+    """The complete worlds printed in llms.txt compile and train to what the
+    page says of them, and the page's claims about labels and grids hold."""
+    page = (ROOT / "llms.txt").read_text()
+    blocks = [b for b in page.split("```") if b.lstrip().startswith("world ")]
+    by_name = {b.split()[1]: b.lstrip() for b in blocks}
+    assert {"Corridor", "Coin"} <= set(by_name), sorted(by_name)
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "corridor.hunch"
+        path.write_text(by_name["Corridor"])
+        got = hunch_json("train", path, "--out", Path(d) / "c.hpol", "--json")
+        assert abs(got["report"]["return"][0] - 0.92) < 1e-9, got["report"]["return"]
+
+        path = Path(d) / "coin.hunch"
+        path.write_text(by_name["Coin"])
+        got = hunch_json("train", path, "--out", Path(d) / "k.hpol", "--json")
+        alice, bob = got["report"]["return"]
+        assert abs(bob - 0.5) < 2e-3 and abs(alice + 0.5) < 2e-3, got["report"]["return"]
+        run = hunch("run", path, "--policy", Path(d) / "k.hpol").stdout
+        assert "including what the agents are not shown" in run, run
+
+        # an observation built in a local array is named by what was put in it
+        path = Path(d) / "labels.hunch"
+        path.write_text("world L\nhorizon 2\nstate { pile: int = 3; top: int = 1; shown: int[4]; }\n"
+                        "step {\n  let obs: float[5];\n  obs[0] = pile;\n"
+                        "  if top == 1 { obs[0] = top; }\n"
+                        "  for i in 0..4 { obs[i + 1] = shown[i]; }\n"
+                        "  let a = hunch p(obs, 2);\n"
+                        "  let seen: float[4];\n  for i in 0..4 { seen[i] = shown[i] * 2; }\n"
+                        "  let b = hunch q(seen, 2);\n  reward(p, a); reward(q, b);\n}\n")
+        out = hunch("test", path).stdout
+        # Two things put in one element are both named. Only a literal index
+        # or the loop variable itself names an element: obs[i + 1] does not.
+        assert "sees     pile | top, obs[1..4]\n" in out, out
+        assert "sees     shown[0] * 2, shown[1] * 2, shown[2] * 2, shown[3] * 2\n" in out, out
+
+        # `wide`: a board is printed as rows, in play and at the end of run
+        bad = Path(d) / "bad.hunch"
+        bad.write_text("world B\nstate { g: int[10] wide 3; }\nstep { let a = hunch p(g, 2); }\n")
+        out = hunch("test", bad)
+        assert out.returncode != 0 and "do not make rows of 3" in out.stderr, out.stderr
+        bad.write_text("world Two Words\nstep { let a = hunch p([0], 2); }\n")
+        out = hunch("test", bad)
+        assert out.returncode != 0 and "a world's name is one word" in out.stderr, out.stderr
+    run = hunch("run", ROOT / "worlds" / "tictactoe.hunch", "--policy", "none", "--seed", "3").stdout
+    assert "x sees board, plays" in run and "\nboard at the end:\n" in run, run
+    grid = run.split("board at the end:\n")[1].splitlines()[:3]
+    assert all(len(row.split()) == 3 for row in grid), grid
+    play = subprocess.run([str(ROOT / "bin" / "hunch"), "play", str(ROOT / "worlds" / "connect4.hunch"),
+                           "--policy", "none", "--as", "first", "--seed", "1"],
+                          input="3\nq\n", capture_output=True, text=True, cwd=str(ROOT))
+    assert play.returncode == 0, play.stderr
+    first, second = play.stdout.split("you see")[1:3]
+    assert first.count(". . . . . . .") == 6, first
+    # `up`: the disc dropped in column 3 is on the bottom row, which is printed last
+    rows = [line.strip() for line in second.splitlines() if set(line.strip()) <= set(". 12") and line.strip()]
+    assert len(rows) == 6 and rows[-1].split()[3] == "1" and rows[0] == ". . . . . . .", second
+
+
 def main() -> int:
     print("language")
     for name, fn in [
@@ -1330,6 +1389,7 @@ def main() -> int:
 
     print("cli")
     check("test shows the shape", test_cli_test_shows_shape)
+    check("the reference page's worlds and claims", test_reference_page_worlds)
 
     print()
     if FAILS:
