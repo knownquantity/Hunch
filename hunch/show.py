@@ -36,6 +36,37 @@ def pct(p: float) -> str:
     return f"{100 * p:.0f}%"
 
 
+def clock(sec: float) -> str:
+    """A duration: 45 s, 3:05, 1:02:30."""
+    sec = int(round(sec))
+    if sec < 60:
+        return f"{sec} s"
+    h, rest = divmod(sec, 3600)
+    m, s = divmod(rest, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def learned_words(learned: dict) -> str:
+    """How a search's network was made (see guide_train in runtime/hunch_vm.c)."""
+    cores = learned.get("cores", 1)
+    return (f"{learned['games']:,} games, {learned['decisions']:,} decisions, "
+            f"in {clock(learned['sec'])} on {cores} core{'' if cores == 1 else 's'}")
+
+
+def mixed(info: dict) -> str:
+    """What a guided search takes as the value of a position it has not met:
+    `rollout` of one random playout from it, the rest the network's estimate."""
+    share = info.get("rollout", 0.5)
+    if share <= 0:
+        return "the value is the network's estimate"
+    if share >= 1:
+        return "the value is one random playout from it"
+    if abs(share - 0.5) < 1e-9:
+        return "the value is half the network's estimate and half one random playout from it"
+    return (f"the value is {1 - share:.0%} the network's estimate and {share:.0%} one random "
+            "playout from it")
+
+
 class Names:
     """The world's own words for agents, actions and observation slots."""
 
@@ -137,6 +168,14 @@ def how_searched(train: dict, sec: str) -> str:
                  f"a second were measured on this machine, and a decision is given "
                  f"{train.get('think', 0.1):g} s")
     what = f"at each decision it forks the world and tries every action, {count} ({sec})"
+    learned = train.get("learned")
+    if learned:
+        # several lines: how it learned, then how it plays
+        what = (f"it learned by playing itself, and a network trained on those games "
+                f"guides it ({sec})\n"
+                f"  self-play: {learned_words(learned)} (--train-sec S sets how long)\n"
+                f"  at each decision it forks the world and tries every action, {count}; "
+                f"where a playout reaches a position it has not met, {mixed(train)}")
     if train.get("chosen"):
         return f"{size}; {seen}, so the policy is a search: {what}"
     head = "the policy is a search, as asked (--algo mcts)"
@@ -323,6 +362,9 @@ def search_report_lines(rep: dict, names: Names) -> List[str]:
              else "no time limit")
     out = [f"{why_not_exact('search', 0)}; {limit}, ± is one standard error",
            f"  the search: {search['playouts']:,} playouts a decision"]
+    if search.get("guide"):
+        out[-1] += (", guided by the network it trained by playing itself "
+                    f"({learned_words(search['guide'])})")
     if search["hidden"] == "found":
         out.append("  this policy looks at the whole state, including what its agent is not "
                    f"shown: {hidden_words('found', search)}")
@@ -634,10 +676,16 @@ def why_search_lines(why: dict, names: Names, detail: bool) -> List[str]:
                f"{search['playouts']:,} playouts at that decision tried it,")
     out.append("and what its agent collected in them on average, from that instant to the "
                "end of the episode.")
-    out.append("In a playout the first moves are the search's own and the rest are random, "
-               "so a mean is the")
-    out.append("search's estimate of an action, not what the action is worth against this "
-               "policy. Nothing was replayed.")
+    if search.get("guide"):
+        out.append("A playout follows the search's own moves to the first position it has not "
+                   "met; there")
+        out.append(f"{mixed(search)}, so a mean is the search's estimate of an action,")
+        out.append("not what the action is worth against this policy. Nothing was replayed.")
+    else:
+        out.append("In a playout the first moves are the search's own and the rest are random, "
+                   "so a mean is the")
+        out.append("search's estimate of an action, not what the action is worth against this "
+                   "policy. Nothing was replayed.")
     if search.get("hidden") == "found":
         out.append("This search looks at the whole state, including what its agent is not "
                    "shown.")

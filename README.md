@@ -126,33 +126,45 @@ Hunch can answer that because the runtime keeps the whole world, its random numb
 
 ## Worlds too big to solve
 
-[`worlds/connect4.hunch`](worlds/connect4.hunch) is standard Connect Four in about 80 lines, with about 4.5 trillion positions. Nothing can follow all of that, so `train` gives you a policy that thinks at each move instead of one worked out ahead of time:
+[`worlds/connect4.hunch`](worlds/connect4.hunch) is standard Connect Four in about 80 lines, with about 4.5 trillion positions. Nothing can follow all of that, so `train` gives you a policy that thinks at each move, and teaches it by having it play itself:
 
 ```text
 $ ./bin/hunch train worlds/connect4.hunch
+     1,920 games of self-play  (30 s)
+     3,648 games of self-play  (1:01)
+     ...
 ConnectFour: too big to follow whole (more than 2,000,000 positions); in 40,000 sampled positions
-nothing an agent was shown hid anything from it, so the policy is a search: at each decision it
-forks the world and tries every action, 3,300 playouts a decision
+nothing an agent was shown hid anything from it [...], so the policy is a search: it learned by
+playing itself, and a network trained on those games guides it (612.6s)
+  self-play: 26,112 games, 706,046 decisions, in 10:00 on 4 cores (--train-sec S sets how long)
+  at each decision it forks the world and tries every action, 2,700 playouts a decision [...];
+  where a playout reaches a position it has not met, the value is half the network's estimate
+  and half one random playout from it
 ...
 $ ./bin/hunch play worlds/connect4.hunch          # sit down against it
 ```
 
-At each decision the policy forks the world, plays every action out thousands of times (Monte Carlo tree search with random playouts), and plays the action that was tried most. It knows nothing about Connect Four beyond the 80 lines. Measured on one core at the default tenth of a second a move:
+At each decision the policy forks the world and tries every action thousands of times (Monte Carlo tree search), then plays the action tried most. A small network steers it, in the manner of AlphaZero: it says which moves are worth trying first and who is winning in a position, and that estimate is averaged with one random playout where the search leaves the positions it has met. `train` makes the network by self-play: the search plays games against itself, the network learns from them where the search spent its effort and who went on to win, and the next games are played with the better network. It knows nothing about Connect Four beyond the 80 lines. Self-play runs for ten minutes by default, on every core (`--train-sec` and `--cores` change that).
+
+Measured after the default ten minutes of self-play on 4 cores, playing on one core at the tenth of a second a move that `train` picks. The opponent on Connect Four is the same search without a network (random playouts), also at a tenth of a second:
 
 | opponent | as first player | as second player |
 |---|---|---|
-| Connect Four, random play | won 30 of 30 | won 30 of 30 |
-| tic-tac-toe, the solved policy (the best result is a draw) | drew 60 of 60 | drew 60 of 60 |
-| four-in-a-row on a 5×4 board, the solved policy (the best result is a draw) | drew 31 of 100, lost 69 | drew 100 of 100 |
+| Connect Four, the search without a network, from the usual empty board | won 46, drew 1, lost 3 of 50 | won 48, lost 2 of 50 |
+| the same, from 50 random openings of four discs | won 27, drew 2, lost 21 of 50 | won 37, drew 2, lost 11 of 50 |
+| four-in-a-row on a 5×4 board, perfect play (the best result is a draw) | drew 100 of 100 | drew 100 of 100 |
+| four-in-a-row on a 5×5 board, perfect play (a draw) | drew 100 of 100 | drew 96, lost 4 of 100 |
 
-The last row is the limit. Against perfect play the search loses most games as the first player, to a trap that closes fifteen moves after its mistake. `--think 1` gives it a second a move, and it then drew 22 of 30. It is a strong player to practise or evaluate against, not a solver.
+The perfect player picks at random among the moves that keep the game's exact value, so the games differ. Without the network, at the same time a move, the search drew 25 of 100 as the first player on the 5×4 board and lost the rest, to a trap that closes fifteen moves after its mistake; on the 5×5 board it drew 74 and 67. `--games 0` gives you that search, with no training.
+
+Strength grew with self-play and then levelled off. From the random openings on Connect Four, against the search without a network, in runs at 3,000 playouts a move (about 0.105 s): 64 games of self-play won 38 of 100, one minute on 4 cores 58, ten minutes on one core 64, ten minutes on 4 cores 69, and thirty minutes on 4 cores 65. A second training run with another seed won 75 of 100 from the empty board and 63 from the openings. Nothing here is proven beyond the games played, and Connect Four has not been measured against perfect play.
 
 ## What `train` does
 
 | the world | method | what you are told |
 |---|---|---|
 | small enough to follow whole: up to two million positions | solved, by backward induction, a search over every outcome, or regret matching (CFR+), depending on what the agents are shown | exact values, and how much any agent could gain by changing its policy alone |
-| too big, and nothing is hidden from the agents | a search at each decision | sampled returns, and what the search weighed at each decision |
+| too big, and nothing is hidden from the agents | a search at each decision, guided by a network it trains by playing itself | sampled returns, and what the search weighed at each decision |
 | too big or real-valued chance, with something hidden | PPO for one agent, sampled regret matching for several | sampled returns with standard errors |
 
 `hunch train`, default settings, one core, against answers that are known:
@@ -197,7 +209,7 @@ The whole language is one page: [`llms.txt`](llms.txt). It is written to be past
 ## Limits
 
 - Exact answers stop at about two million positions. Past that, or with `rand()`, results are sampled and say so.
-- The search beats random play and loses to perfect play where the right move pays off many moves later. It reads the whole state, so `train` picks it only when sampling finds nothing hidden, which is evidence and not proof.
+- The search reads the whole state, so `train` picks it only when sampling finds nothing hidden, which is evidence and not proof. Its self-play takes ten minutes by default and gets what it can in that time: a machine with fewer cores plays fewer games and ends weaker. It has been measured on two-player board games only.
 - Big worlds with hidden information get PPO with a small network or sampled regret matching, on one core. Expect much less from them than from the exact solver: on liar's dice, 20 seconds of sampling gets within 0.05 of an equilibrium and the exact solver within 0.0008.
 - Regret matching is known to approach an equilibrium only with two agents whose rewards sum to zero.
 - Tested on Linux with gcc. macOS and Windows have not been run.

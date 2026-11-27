@@ -73,7 +73,7 @@ The runtime holds the whole world, its random number generator included, in one 
 | small, and no agent would choose differently if it saw the whole state (board games, Nim, most one-agent worlds) | backward induction over every position | the value, and a policy that attains it, exactly |
 | small, one agent | search over every outcome | the best any policy can collect, when that can be proven; otherwise the best found and the ceiling for an agent that saw everything |
 | small, several agents | regret matching (CFR+) over every outcome | each agent's value, and how much each could gain by changing alone (NashConv) |
-| too big to follow, and sampling finds nothing hidden from the agents | a search at each decision (`mcts`) | the return against random play, sampled, and what the search weighed at each decision |
+| too big to follow, and sampling finds nothing hidden from the agents | a search at each decision (`mcts`), guided by a network it trains by playing itself | the return against random play, sampled, and what the search weighed at each decision |
 | too big to follow or uses `rand()`, something hidden, one agent | PPO with a 32×32 network | the return with a standard error, against random play |
 | too big to follow, something hidden, several agents | regret matching on sampled episodes | the same, sampled |
 
@@ -131,7 +131,7 @@ Use whole numbers in observations when the thing observed is a whole number. A t
 - The network is a 32×32 MLP on one CPU core. This is for small worlds.
 - `grade` is exact for the agent and the opponents you give it. What an agent "gives away" is read off a reference policy, so it is as sharp as that policy is close to an equilibrium (0.001 by default), and the report says how close. Where an episode can show an agent the same thing twice, a decision's cost is for changing one visit only.
 - An exact `grade` asks your agent about every situation once, so it needs an agent whose answer depends only on what it is shown. A language model sampled at a temperature is graded on the answers it happened to give; ask it for probabilities, or ask several times and average, if you want its mixed strategy. Leduc has 468 situations a seat and liar's dice 12,288, which is that many model calls.
-- A search policy is plain UCT with random playouts: about 190,000 playouts a second on tic-tac-toe and 33,000 on Connect Four, on one core. It beats random play every time and loses to perfect play where the right move pays off many moves later (see [Worlds too big to solve](../README.md#worlds-too-big-to-solve)). It cannot be scored exactly, so its report is a few sampled episodes. The check that nothing is hidden is by sampling, which is evidence and not proof.
+- A search policy is Monte Carlo tree search guided by a network, as in AlphaZero: PUCT over the network's policy, and where a playout reaches a position the search has not met, a value that is half the network's estimate and half one random playout from there (the mix AlphaGo used; on Connect Four the network's value alone did worse, and on the 5×4 board random playouts alone did worse). Self-play leaves the random playout out, which plays more games and learned no worse. `train` makes the network by self-play for `--train-sec` seconds (default 600) on every core (`--cores N`), in rounds of 64 games at 200 playouts a move; it learns where the search spent its playouts and how each game ended, from the most recent 100,000 decisions. The network is two layers of 64 units; each part of an observation that takes at most 8 values in random play (a board cell) is one input per value. The time is fixed, not the games, so a machine with fewer cores ends with a weaker policy; `--games N` makes the same policy on any number of cores. `--games 0` is the search without a network, UCT with random playouts: about 190,000 playouts a second on tic-tac-toe and 33,000 on Connect Four, on one core, and it loses to perfect play where the right move pays off many moves later. Measured results are in [Worlds too big to solve](../README.md#worlds-too-big-to-solve); only two-player board games have been measured. A search cannot be scored exactly, so its report is a few sampled episodes. The check that nothing is hidden is by sampling, which is evidence and not proof.
 - `grade` against a search policy on a big world plays whole episodes with a search at every move; expect it to take an hour, not seconds.
 - The Python package is tested on Linux with gcc. The build flags are the same ones clang takes, but macOS and Windows have not been run.
 - The language has no modules, no strings, and no recursion, on purpose: a world that fits on a page is one a person or a model can get right.
@@ -157,7 +157,7 @@ Hunch began as an experiment in credit assignment: replay a decision once per ac
 │   ├── bindings.py               gymnasium and PettingZoo
 │   ├── search.py                 tree search over forks
 │   └── studio_server.py          HTTP and JSON API behind the Studio
-├── runtime/hunch_vm.c            the whole engine: VM, exact graph, regret matching, search, MLP, PPO, fork; also built as a library
+├── runtime/hunch_vm.c            the whole engine: VM, exact graph, regret matching, search and its self-play, MLP, PPO, fork; also built as a library
 ├── worlds/                       one .hunch file each
 ├── examples/                     grade PPO, a program or a language model; search Connect Four
 ├── policies/                     shipped trained policies for the Studio
@@ -169,7 +169,7 @@ Hunch began as an experiment in credit assignment: replay a decision once per ac
 ```
 
 ```bash
-python3 tests/test_compiler.py            # 51 tests, about fifteen seconds
+python3 tests/test_compiler.py            # 52 tests, about twenty seconds
 python3 tests/test_bindings.py            # the Python package; numpy, gymnasium and pettingzoo checks run when installed
 python3 tests/fuzz_exact.py               # 200 random worlds: exact answers against brute force
 ```

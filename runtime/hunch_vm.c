@@ -17,6 +17,9 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <sys/resource.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -133,6 +136,30 @@ static inline uint64_t rng_next(uint64_t s[4]) {
 
 static inline double rng_double(uint64_t s[4]) {
     return (double)(rng_next(s) >> 11) * (1.0 / 9007199254740992.0);
+}
+
+/* A draw from Gamma(alpha, 1), for Dirichlet noise (Marsaglia and Tsang). */
+static double rng_gamma(uint64_t s[4], double alpha) {
+    double boost = 1.0;
+    if (alpha < 1.0) {
+        double u = rng_double(s);
+        boost = pow(u > 1e-300 ? u : 1e-300, 1.0 / alpha);
+        alpha += 1.0;
+    }
+    double d = alpha - 1.0 / 3.0, c = 1.0 / sqrt(9.0 * d);
+    for (;;) {
+        double x, v;
+        do {
+            double u1 = rng_double(s), u2 = rng_double(s);
+            x = sqrt(-2.0 * log(u1 > 1e-300 ? u1 : 1e-300)) * cos(6.283185307179586 * u2);
+            v = 1.0 + c * x;
+        } while (v <= 0.0);
+        v = v * v * v;
+        double u = rng_double(s);
+        if (u < 1.0 - 0.0331 * x * x * x * x ||
+            log(u > 1e-300 ? u : 1e-300) < 0.5 * x * x + d * (1.0 - v + log(v)))
+            return d * v * boost;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -684,7 +711,7 @@ static uint64_t g_trace_seed = 0;
 
 struct Search;
 static int search_choose(struct Search *S, struct VM *vm, int ip, int agent, int n_act,
-                         uint32_t legal);
+                         uint32_t legal, const double *obs, int obs_len);
 static void search_found(const struct Search *S, int *tries, double *mean);
 
 typedef struct VM {
@@ -1104,7 +1131,7 @@ static void vm_exec(VM *vm, int ip) {
                 /* The draw above is the only one taken from the world's
                  * stream: the search has its own, started from the instant. */
                 vm->at_ip = ip;
-                action = search_choose(search, vm, ip, agent, n_act, legal);
+                action = search_choose(search, vm, ip, agent, n_act, legal, vm->scratch, obs_len);
                 for (int i = 0; i < n_act; i++) probs[i] = i == action ? 1.0 : 0.0;
                 searched = 1;
             } else if (!net && !by_table) {
@@ -2316,6 +2343,160 @@ static int has_flag(int argc, char **argv, const char *flag) {
 }
 
 /* ------------------------------------------------------------------ */
+/* The network a search learns to lean on                              */
+/* ------------------------------------------------------------------ */
+
+/* A search can be guided by what its earlier games taught it, in the manner
+ * of AlphaZero. A small network reads what the agent to move is shown and
+ * says two things: which actions are worth trying first (learned from where
+ * earlier searches spent their playouts) and what every agent goes on to
+ * collect from here (learned from how those games ended). A guided search
+ * leaves its tree at the first position it has not met, as before, and
+ * takes as that position's value a mix: `rollout` (half) of one random
+ * playout from it, and the rest the network's estimate, as AlphaGo did. On
+ * Connect Four the network's value alone played worse than the mix, and on
+ * a 5 by 4 board random playouts alone did.
+ *
+ * What the agent is shown is turned into inputs part by part. A part that
+ * took at most GUIDE_ONEHOT different values while the world was played at
+ * random (a board cell: empty, mine, theirs) gets one input per value, 1 for
+ * the value it has; any other part is one input, centred and scaled. When
+ * every agent is shown the same shape and has the same actions, they share
+ * one network, with one more input per agent saying whose turn it is. */
+#define GUIDE_ONEHOT  8
+#define GUIDE_MAX_HID 256
+
+typedef struct {
+    int obs_dim, nact, nval, hid, shared, nin;
+    int nv[MAX_OBS];                    /* values with an input each; 0: one scaled input */
+    double val[MAX_OBS][GUIDE_ONEHOT];
+    double mean[MAX_OBS], scale[MAX_OBS];
+    int off[MAX_OBS];                   /* first input of each part */
+    int o_w1, o_b1, o_w2, o_b2, o_wp, o_bp, o_wv, o_bv, total;
+    double *w, *g, *m, *v;              /* g, m and v only while training */
+    long opt_step;
+} GNet;
+
+typedef struct {
+    int nnets;
+    int net_of[MAX_AGENTS];
+    GNet *net[MAX_AGENTS];
+    double vscale;                      /* values are learned divided by this */
+    /* how it was made, for the report */
+    long games, samples, rounds;
+    double sec;
+    int cores, playouts;
+} Guide;
+
+/* One pass through a network, kept for its gradient. */
+typedef struct {
+    int n;                              /* inputs that are not zero */
+    int idx[MAX_OBS + MAX_AGENTS];
+    double x[MAX_OBS + MAX_AGENTS];
+    double h1[GUIDE_MAX_HID], h2[GUIDE_MAX_HID];
+    double probs[MAX_ACT], value[MAX_AGENTS];
+} GPass;
+
+static void gnet_layout(GNet *n) {
+    int k = 0;
+    for (int d = 0; d < n->obs_dim; d++) { n->off[d] = k; k += n->nv[d] ? n->nv[d] : 1; }
+    n->nin = k + (n->shared ? n->nval : 0);
+    int o = 0, H = n->hid;
+    n->o_w1 = o; o += n->nin * H;       /* by input: an input's weights are side by side */
+    n->o_b1 = o; o += H;
+    n->o_w2 = o; o += H * H;
+    n->o_b2 = o; o += H;
+    n->o_wp = o; o += n->nact * H;
+    n->o_bp = o; o += n->nact;
+    n->o_wv = o; o += n->nval * H;
+    n->o_bv = o; o += n->nval;
+    n->total = o;
+}
+
+static void gnet_free(GNet *n) {
+    if (!n) return;
+    free(n->w); free(n->g); free(n->m); free(n->v); free(n);
+}
+
+static void guide_free(Guide *G) {
+    if (!G) return;
+    for (int k = 0; k < G->nnets; k++) gnet_free(G->net[k]);
+    free(G);
+}
+
+static void gnet_encode(const GNet *n, int agent, const double *obs, int len, GPass *ps) {
+    ps->n = 0;
+    for (int d = 0; d < n->obs_dim; d++) {
+        double v = d < len ? obs[d] : 0.0;
+        if (n->nv[d]) {
+            for (int k = 0; k < n->nv[d]; k++)
+                if (n->val[d][k] == v) {
+                    ps->idx[ps->n] = n->off[d] + k;
+                    ps->x[ps->n++] = 1.0;
+                    break;
+                }
+        } else {
+            ps->idx[ps->n] = n->off[d];
+            ps->x[ps->n++] = (v - n->mean[d]) / n->scale[d];
+        }
+    }
+    if (n->shared) {
+        ps->idx[ps->n] = n->nin - n->nval + agent;
+        ps->x[ps->n++] = 1.0;
+    }
+}
+
+/* Two layers of rectified units; the policy over the legal actions and a
+ * value for every agent. */
+static void gnet_forward(const GNet *n, GPass *ps, int n_act, uint32_t legal) {
+    const int H = n->hid;
+    const double *w = n->w;
+    double pre[GUIDE_MAX_HID];
+    memcpy(pre, w + n->o_b1, sizeof(double) * (size_t)H);
+    for (int k = 0; k < ps->n; k++) {
+        const double *col = w + n->o_w1 + (size_t)ps->idx[k] * H;
+        double xv = ps->x[k];
+        for (int i = 0; i < H; i++) pre[i] += xv * col[i];
+    }
+    for (int i = 0; i < H; i++) ps->h1[i] = pre[i] > 0 ? pre[i] : 0.0;
+    for (int i = 0; i < H; i++) {
+        const double *row = w + n->o_w2 + (size_t)i * H;
+        double acc = w[n->o_b2 + i];
+        for (int j = 0; j < H; j++) acc += row[j] * ps->h1[j];
+        ps->h2[i] = acc > 0 ? acc : 0.0;
+    }
+    double maxl = -HUGE_VAL, sum = 0.0;
+    for (int a = 0; a < n_act; a++) {
+        ps->probs[a] = 0.0;
+        if (!((legal >> a) & 1u)) continue;
+        const double *row = w + n->o_wp + (size_t)a * H;
+        double acc = w[n->o_bp + a];
+        for (int i = 0; i < H; i++) acc += row[i] * ps->h2[i];
+        ps->probs[a] = acc;
+        if (acc > maxl) maxl = acc;
+    }
+    for (int a = 0; a < n_act; a++)
+        if ((legal >> a) & 1u) { ps->probs[a] = exp(ps->probs[a] - maxl); sum += ps->probs[a]; }
+    for (int a = 0; a < n_act; a++) ps->probs[a] /= sum;
+    for (int j = 0; j < n->nval; j++) {
+        const double *row = w + n->o_wv + (size_t)j * H;
+        double acc = w[n->o_bv + j];
+        for (int i = 0; i < H; i++) acc += row[i] * ps->h2[i];
+        ps->value[j] = acc;
+    }
+}
+
+/* What the network says at a decision of `agent`: ps->probs over the legal
+ * actions, and ps->value in the world's own units. */
+static void guide_eval(const Guide *G, int agent, const double *obs, int len, int n_act,
+                       uint32_t legal, GPass *ps) {
+    const GNet *n = G->net[G->net_of[agent]];
+    gnet_encode(n, agent, obs, len, ps);
+    gnet_forward(n, ps, n_act, legal);
+    for (int j = 0; j < n->nval; j++) ps->value[j] *= G->vscale;
+}
+
+/* ------------------------------------------------------------------ */
 /* Search: a policy that forks the world at each decision              */
 /* ------------------------------------------------------------------ */
 
@@ -2353,6 +2534,20 @@ typedef struct {
 
 typedef struct { long node; int action; double before; } SPath;
 
+/* A decision of a game the search played against itself, for the network to
+ * learn from: what the agent was shown, where the search spent its playouts,
+ * and what each agent went on to collect. */
+typedef struct {
+    long game;
+    int ply, agent, n_act, obs_len;
+    uint32_t legal;
+    float pi[MAX_ACT];
+    double z[MAX_AGENTS];       /* collected before it, until the game ends */
+    double obs[MAX_OBS];
+} GSample;
+
+typedef struct { GSample *d; long n, cap; } GBuf;
+
 typedef struct Search {
     Driver dr;          /* first, so a Driver * is a Search * */
     const Program *p;
@@ -2387,6 +2582,25 @@ typedef struct Search {
     long played, searches;
     /* what train's check of the world saw (see shown_check), kept in the file */
     long checked[4];
+    /* With a network (see "The network a search learns to lean on") the
+     * value at the first position not met before is the network's, mixed
+     * with one random playout from there: the playout's `leaf`, what each
+     * agent collects by the end, counted from the start of the playout. */
+    Guide *guide;
+    float *prior;       /* per node, like `tries`: the network's policy there */
+    double *v0;         /* per node: what the network said its agent collects from there */
+    int leafed;
+    double leaf[MAX_AGENTS];
+    double mix;         /* the share of a leaf's value that is a random playout from it (rollout) */
+    GPass pass;
+    /* Self-play, while train makes the network: the root's policy gets noise,
+     * the first `sample_moves` decisions of a game are drawn in proportion to
+     * the playouts, and every decision is kept in `rec`. */
+    int selfplay, sample_moves, moves;
+    double noise;       /* the share of the root's policy that is noise */
+    double ep_paid[MAX_AGENTS];         /* collected in this game before the step running */
+    GBuf *rec;
+    long game;
 } Search;
 
 /* The instant a VM stands at, asked a decision: who is asked, the step, where
@@ -2422,6 +2636,8 @@ static Search *search_new(const Program *p, int playouts, double explore, int hi
 static void search_free(Search *S) {
     if (!S) return;
     free(S->nodes); free(S->tries); free(S->total); free(S->slot); free(S->path);
+    free(S->prior); free(S->v0);
+    guide_free(S->guide);
     free(S);
 }
 
@@ -2459,6 +2675,28 @@ static int search_pick(Search *S, long id) {
     const SNode *n = &S->nodes[id];
     const int *tries = S->tries + n->stat;
     const double *total = S->total + n->stat;
+    if (S->guide) {
+        /* PUCT, as in AlphaZero: the value found so far, scaled to the range
+         * seen, plus a share of `explore` that the network's policy hands
+         * out and that shrinks as an action is tried. An action not tried
+         * yet is taken to be worth what the position is worth so far. */
+        const float *prior = S->prior + n->stat;
+        double sum = S->v0[id];
+        for (int a = 0; a < n->n_act; a++) sum += total[a];
+        double here = sum / (n->visits + 1.0);
+        int known = S->high > S->low;
+        double span = known ? S->high - S->low : 1.0;
+        double push = S->explore * sqrt(n->visits + 1.0);
+        int best = -1;
+        double best_score = 0.0;
+        for (int a = 0; a < n->n_act; a++) {
+            if (!((n->legal >> a) & 1u)) continue;
+            double q = tries[a] ? total[a] / tries[a] : here;
+            double score = (known ? (q - S->low) / span : 0.5) + push * prior[a] / (1.0 + tries[a]);
+            if (best < 0 || score > best_score) { best = a; best_score = score; }
+        }
+        return best;
+    }
     int untried = 0;
     for (int a = 0; a < n->n_act; a++)
         if (((n->legal >> a) & 1u) && tries[a] == 0) untried++;
@@ -2491,11 +2729,22 @@ static void search_step_in(Search *S, long id, int action, double before) {
     S->npath++;
 }
 
+/* The network's word on a position: its policy kept with the node (unless
+ * there is no room for one, id < 0), its values left in S->pass. */
+static void search_expand(Search *S, long id, int agent, const double *obs, int obs_len,
+                          int n_act, uint32_t legal) {
+    guide_eval(S->guide, agent, obs, obs_len, n_act, legal, &S->pass);
+    if (id < 0) return;
+    const SNode *n = &S->nodes[id];
+    for (int a = 0; a < n_act; a++) S->prior[n->stat + a] = (float)S->pass.probs[a];
+    S->v0[id] = S->pass.value[agent];
+}
+
 /* Every decision of a playout after the first comes here. */
 static int search_decide(Driver *dr, VM *vm, int agent, const double *obs, int obs_len,
                          int n_act, uint32_t legal, const double *probs) {
     Search *S = (Search *)dr;
-    (void)obs; (void)obs_len; (void)probs;
+    (void)probs;
     /* Past the remembered positions play is uniform, drawn by the VM from
      * the playout's own stream. */
     if (S->rollout) return DRIVE_PASS;
@@ -2503,6 +2752,16 @@ static int search_decide(Driver *dr, VM *vm, int agent, const double *obs, int o
     int fresh;
     search_key(vm, agent, &h1, &h2);
     long id = search_node(S, h1, h2, agent, n_act, legal, &fresh);
+    if (S->guide && (id < 0 || fresh)) {
+        /* A position not met before: the network says what it is worth, and
+         * the playout ends here, or plays on at random to be mixed in. */
+        search_expand(S, id, agent, obs, obs_len, n_act, legal);
+        for (int a = 0; a < S->p->nagents; a++)
+            S->leaf[a] = S->paid[a] + (vm->in_init ? 0.0 : vm->agent_reward[a]) + S->pass.value[a];
+        S->leafed = 1;
+        if (S->mix > 0) { S->rollout = 1; return DRIVE_PASS; }
+        return DRIVE_STOP;
+    }
     if (id < 0) { S->rollout = 1; return DRIVE_PASS; }
     int action = search_pick(S, id);
     /* What init pays is dropped by the runtime, so it is not counted here. */
@@ -2513,7 +2772,8 @@ static int search_decide(Driver *dr, VM *vm, int agent, const double *obs, int o
 
 /* Called by a VM in the middle of a block, at a decision of `agent`: `ip` is
  * the instruction after it. Returns the action to play. */
-static int search_choose(Search *S, VM *vm, int ip, int agent, int n_act, uint32_t legal) {
+static int search_choose(Search *S, VM *vm, int ip, int agent, int n_act, uint32_t legal,
+                         const double *obs, int obs_len) {
     const Program *p = S->p;
     double t0 = S->slice > 0 ? now_sec() : 0.0;
     size_t state_bytes = offsetof(State, v) + sizeof(double) * (size_t)p->nslots;
@@ -2529,6 +2789,10 @@ static int search_choose(Search *S, VM *vm, int ip, int agent, int n_act, uint32
         S->tries = (int *)xmalloc(sizeof(int) * (size_t)S->cap * (size_t)S->width);
         S->total = (double *)xmalloc(sizeof(double) * (size_t)S->cap * (size_t)S->width);
         S->slot = (long *)xmalloc(sizeof(long) * (size_t)S->nslot);
+        if (S->guide) {
+            S->prior = (float *)xmalloc(sizeof(float) * (size_t)S->cap * (size_t)S->width);
+            S->v0 = (double *)xmalloc(sizeof(double) * (size_t)S->cap);
+        }
         vm_init(&S->vm, p, &S->st);
         S->dr.decide = search_decide;
     }
@@ -2555,6 +2819,22 @@ static int search_choose(Search *S, VM *vm, int ip, int agent, int n_act, uint32
     uint64_t seed = mix64(h1, h2);
     for (int i = 0; i < 4; i++) seed = mix64(seed, vm->s->rng[i]);
     rng_seed(S->rng, seed);
+    if (S->guide) {
+        search_expand(S, root, agent, obs, obs_len, n_act, legal);
+        if (S->selfplay && S->noise > 0) {
+            /* Dirichlet noise, so that self-play tries what the network
+             * would not; never in play. */
+            float *prior = S->prior + S->nodes[root].stat;
+            int k = mask_count(legal, n_act);
+            double alpha = k > 10 ? 10.0 / k : 1.0, d[MAX_ACT], sum = 0.0;
+            for (int a = 0; a < n_act; a++)
+                if ((legal >> a) & 1u) { d[a] = rng_gamma(S->rng, alpha); sum += d[a]; }
+            for (int a = 0; a < n_act; a++)
+                if ((legal >> a) & 1u)
+                    prior[a] = (float)((1.0 - S->noise) * prior[a] +
+                                       S->noise * (sum > 0 ? d[a] / sum : 1.0 / k));
+        }
+    }
 
     VM *sv = &S->vm;
     int ran = 0;
@@ -2579,21 +2859,29 @@ static int search_choose(Search *S, VM *vm, int ip, int agent, int n_act, uint32
         memset(S->paid, 0, sizeof(S->paid));
         S->npath = 0;
         S->rollout = 0;
+        S->leafed = 0;
 
         int first = search_pick(S, root);
         search_step_in(S, root, first, 0.0);
         push(sv, (double)first);
         vm_exec(sv, ip);                /* the rest of the block the decision is in */
-        if (!in_init)
-            for (int a = 0; a < p->nagents; a++) S->paid[a] += sv->agent_reward[a];
-        while (!S->st.done && S->st.step < S->horizon) {
-            vm_step(sv);
-            for (int a = 0; a < p->nagents; a++) S->paid[a] += sv->agent_reward[a];
+        if (!sv->stopped) {
+            if (!in_init)
+                for (int a = 0; a < p->nagents; a++) S->paid[a] += sv->agent_reward[a];
+            while (!S->st.done && S->st.step < S->horizon) {
+                vm_step(sv);
+                if (sv->stopped) break;
+                for (int a = 0; a < p->nagents; a++) S->paid[a] += sv->agent_reward[a];
+            }
         }
+        if (S->leafed && !sv->stopped)
+            for (int a = 0; a < p->nagents; a++)
+                S->leaf[a] = (1.0 - S->mix) * S->leaf[a] + S->mix * S->paid[a];
+        const double *got = S->leafed ? S->leaf : S->paid;
 
         for (int k = 0; k < S->npath; k++) {
             SNode *nd = &S->nodes[S->path[k].node];
-            double v = S->paid[nd->agent] - S->path[k].before;
+            double v = got[nd->agent] - S->path[k].before;
             if (v < S->low) S->low = v;
             if (v > S->high) S->high = v;
             nd->visits++;
@@ -2607,16 +2895,49 @@ static int search_choose(Search *S, VM *vm, int ip, int agent, int n_act, uint32
 
     /* the action tried most; between equals the one that did better, then the first */
     const SNode *nd = &S->nodes[root];
-    int best = -1;
+    int best = -1, all = 0;
     S->found_n = n_act;
     for (int a = 0; a < n_act; a++) {
         int t = S->tries[nd->stat + a];
         S->found_tries[a] = t;
         S->found_mean[a] = t ? S->total[nd->stat + a] / t : 0.0;
         if (!((legal >> a) & 1u)) continue;
+        all += t;
         if (best < 0 || t > S->found_tries[best] ||
             (t == S->found_tries[best] && S->found_mean[a] > S->found_mean[best]))
             best = a;
+    }
+    if (S->selfplay) {
+        if (S->rec) {
+            GBuf *b = S->rec;
+            if (b->n >= b->cap) {
+                b->cap = b->cap ? b->cap * 2 : 1024;
+                b->d = (GSample *)xrealloc(b->d, sizeof(GSample) * (size_t)b->cap);
+            }
+            GSample *g = &b->d[b->n++];
+            memset(g, 0, sizeof(*g));
+            g->game = S->game;
+            g->ply = S->moves;
+            g->agent = agent;
+            g->n_act = n_act;
+            g->legal = legal;
+            g->obs_len = obs_len < MAX_OBS ? obs_len : MAX_OBS;
+            memcpy(g->obs, obs, sizeof(double) * (size_t)g->obs_len);
+            for (int a = 0; a < n_act; a++)
+                g->pi[a] = all > 0 ? (float)S->found_tries[a] / (float)all : 0.0f;
+            for (int a = 0; a < p->nagents; a++)
+                g->z[a] = S->ep_paid[a] + (in_init ? 0.0 : vm->agent_reward[a]);
+        }
+        /* the opening of a self-play game is drawn, so that games differ */
+        if (S->moves < S->sample_moves && all > 0) {
+            int k = (int)(rng_double(S->rng) * all);
+            for (int a = 0; a < n_act; a++) {
+                if (!((legal >> a) & 1u)) continue;
+                k -= S->found_tries[a];
+                if (k < 0) { best = a; break; }
+            }
+        }
+        S->moves++;
     }
     if (S->slice > 0 && ran > 0) S->cost += (now_sec() - t0) / ran;
     return best;
@@ -2632,17 +2953,99 @@ static void search_found(const Search *S, int *tries, double *mean) {
 
 static const char *const HIDDEN_NAME[] = { "nothing", "found", "unknown" };
 
+/* A search with a network is version 2: the lines of version 1, then
+ *   rollout SHARE
+ *   guide NETS VSCALE GAMES DECISIONS ROUNDS SECONDS CORES PLAYOUTS
+ *   of NET-OF-AGENT-0 NET-OF-AGENT-1 ...
+ * and for each network
+ *   net OBS ACTIONS VALUES HIDDEN SHARED
+ *   in COUNT VALUE...      (one line per part of the observation; in 0 MEAN SCALE)
+ *   w TOTAL, then that many weights. */
 static void save_search(const char *path, const Program *p, const Search *S) {
     FILE *f = fopen(path, "w");
     if (!f) fatal(1, "hunch-vm: cannot write %s: %s", path, strerror(errno));
-    fprintf(f, "HUNCHSEARCH 1\nworld %s\nplayouts %d\nexplore %.9g\nhidden %s\n"
-            "checked %ld %ld %ld %ld\n", p->world, S->playouts, S->explore,
+    const Guide *G = S->guide;
+    fprintf(f, "HUNCHSEARCH %d\nworld %s\nplayouts %d\nexplore %.9g\nhidden %s\n"
+            "checked %ld %ld %ld %ld\n", G ? 2 : 1, p->world, S->playouts, S->explore,
             HIDDEN_NAME[S->hidden], S->checked[0], S->checked[1], S->checked[2], S->checked[3]);
-    fclose(f);
+    if (G) {
+        fprintf(f, "rollout %.9g\n", S->mix);
+        fprintf(f, "guide %d %.17g %ld %ld %ld %.3f %d %d\nof", G->nnets, G->vscale, G->games,
+                G->samples, G->rounds, G->sec, G->cores, G->playouts);
+        for (int a = 0; a < p->nagents; a++) fprintf(f, " %d", G->net_of[a]);
+        fputc('\n', f);
+        for (int k = 0; k < G->nnets; k++) {
+            const GNet *n = G->net[k];
+            fprintf(f, "net %d %d %d %d %d\n", n->obs_dim, n->nact, n->nval, n->hid, n->shared);
+            for (int d = 0; d < n->obs_dim; d++) {
+                fprintf(f, "in %d", n->nv[d]);
+                if (n->nv[d])
+                    for (int j = 0; j < n->nv[d]; j++) fprintf(f, " %.17g", n->val[d][j]);
+                else
+                    fprintf(f, " %.17g %.17g", n->mean[d], n->scale[d]);
+                fputc('\n', f);
+            }
+            fprintf(f, "w %d\n", n->total);
+            for (int i = 0; i < n->total; i++)
+                fprintf(f, "%.17g%c", n->w[i], i % 8 == 7 || i == n->total - 1 ? '\n' : ' ');
+        }
+    }
+    if (fclose(f) != 0) fatal(1, "hunch-vm: cannot write %s: %s", path, strerror(errno));
+}
+
+/* The network of a version 2 file, after its `guide` tag; NULL if it does
+ * not fit this world. */
+static Guide *guide_read(FILE *f, const Program *p) {
+    Guide *G = (Guide *)xcalloc(1, sizeof(Guide));
+    char tag[16];
+    if (fscanf(f, "%d %lf %ld %ld %ld %lf %d %d", &G->nnets, &G->vscale, &G->games, &G->samples,
+               &G->rounds, &G->sec, &G->cores, &G->playouts) != 8 ||
+        G->nnets < 1 || G->nnets > p->nagents || !(G->vscale > 0) || !isfinite(G->vscale))
+        goto bad;
+    if (fscanf(f, "%15s", tag) != 1 || strcmp(tag, "of") != 0) goto bad;
+    for (int a = 0; a < p->nagents; a++)
+        if (fscanf(f, "%d", &G->net_of[a]) != 1 || G->net_of[a] < 0 || G->net_of[a] >= G->nnets)
+            goto bad;
+    for (int k = 0; k < G->nnets; k++) {
+        GNet *n = (GNet *)xcalloc(1, sizeof(GNet));
+        G->net[k] = n;
+        int total = 0;
+        if (fscanf(f, "%15s %d %d %d %d %d", tag, &n->obs_dim, &n->nact, &n->nval, &n->hid,
+                   &n->shared) != 6 || strcmp(tag, "net") != 0 || n->obs_dim < 0 ||
+            n->obs_dim > MAX_OBS || n->nact < 1 || n->nact > MAX_ACT || n->nval != p->nagents ||
+            n->hid < 1 || n->hid > GUIDE_MAX_HID || (n->shared != 0 && n->shared != 1))
+            goto bad;
+        for (int d = 0; d < n->obs_dim; d++) {
+            if (fscanf(f, "%15s %d", tag, &n->nv[d]) != 2 || strcmp(tag, "in") != 0 ||
+                n->nv[d] < 0 || n->nv[d] > GUIDE_ONEHOT)
+                goto bad;
+            for (int j = 0; j < n->nv[d]; j++)
+                if (fscanf(f, "%lf", &n->val[d][j]) != 1) goto bad;
+            if (!n->nv[d] && (fscanf(f, "%lf %lf", &n->mean[d], &n->scale[d]) != 2 ||
+                              !(n->scale[d] > 0)))
+                goto bad;
+        }
+        gnet_layout(n);
+        if (fscanf(f, "%15s %d", tag, &total) != 2 || strcmp(tag, "w") != 0 || total != n->total)
+            goto bad;
+        n->w = (double *)xmalloc(sizeof(double) * (size_t)n->total);
+        for (int i = 0; i < n->total; i++)
+            if (fscanf(f, "%lf", &n->w[i]) != 1 || !isfinite(n->w[i])) goto bad;
+    }
+    for (int a = 0; a < p->nagents; a++) {
+        const GNet *n = G->net[G->net_of[a]];
+        if (n->obs_dim != p->agents[a].obs_dim || n->nact != p->agents[a].n_act) goto bad;
+    }
+    return G;
+bad:
+    guide_free(G);
+    return NULL;
 }
 
 /* The rest of a HUNCHSEARCH file, after its first line. */
-static Search *load_search(FILE *f, const Program *p) {
+static Search *load_search(FILE *f, const Program *p, int version) {
+    Guide *guide = NULL;
+    double mix = 0.0;
     char tag[64], word[64];
     int playouts = 0, hidden = HIDDEN_UNKNOWN;
     double explore = 1.0;
@@ -2664,13 +3067,24 @@ static Search *load_search(FILE *f, const Program *p) {
         } else if (strcmp(tag, "checked") == 0) {
             if (fscanf(f, "%ld %ld %ld %ld", &checked[0], &checked[1], &checked[2],
                        &checked[3]) != 4) return NULL;
+        } else if (strcmp(tag, "rollout") == 0 && version == 2) {
+            if (fscanf(f, "%lf", &mix) != 1 || !(mix >= 0.0 && mix <= 1.0)) return NULL;
+        } else if (strcmp(tag, "guide") == 0 && version == 2 && !guide) {
+            guide = guide_read(f, p);
+            if (!guide) return NULL;
         } else {
+            guide_free(guide);
             return NULL;
         }
     }
-    if (playouts < 1 || !(explore >= 0.0) || explore > 1e6) return NULL;
+    if (playouts < 1 || !(explore >= 0.0) || explore > 1e6 || (version == 2) != (guide != NULL)) {
+        guide_free(guide);
+        return NULL;
+    }
     Search *S = search_new(p, playouts, explore, hidden);
     memcpy(S->checked, checked, sizeof(checked));
+    S->guide = guide;
+    S->mix = mix;
     return S;
 }
 
@@ -2784,9 +3198,12 @@ static int shown_check(const Program *p, int horizon, uint64_t seed, long out[4]
  * covers the decisions of the first episode or two; an episode much longer
  * than `searches` decisions is measured at its start only. */
 static double search_measure(const Program *p, int horizon, double explore, uint64_t seed,
-                             double slice, int searches, double budget) {
+                             double slice, int searches, double budget, Guide *guide,
+                             double mix) {
     Search *M = search_new(p, 100000, explore, HIDDEN_UNKNOWN);
     M->horizon = horizon;
+    M->guide = guide;
+    M->mix = guide ? mix : 0.0;
     M->slice = slice;
     State *s = (State *)xmalloc(sizeof(State));
     VM *vm = (VM *)xmalloc(sizeof(VM));
@@ -2803,8 +3220,393 @@ static double search_measure(const Program *p, int horizon, double explore, uint
     }
     double rate = M->cost > 0 ? (double)M->searches / M->cost : 0.0;
     free(vm); free(s);
+    M->guide = NULL;            /* the caller's */
     search_free(M);
     return rate;
+}
+
+/* ------------------------------------------------------------------ */
+/* Learning to search: self-play                                       */
+/* ------------------------------------------------------------------ */
+
+/* train makes a search's network by self-play. A round is a number of games
+ * played by the search against itself with the network it has so far (with
+ * noise at the root and the first moves drawn, so that games differ); every
+ * decision of them is kept: what the agent was shown, where the search spent
+ * its playouts, and what each agent went on to collect. The network is then
+ * trained on the most recent decisions to say where a search would spend its
+ * playouts and what each agent will collect, and the next round is played
+ * with it. A better network makes a better search, whose games teach a better
+ * network.
+ *
+ * Games are spread over processes, one per core, and gathered in the order
+ * they were numbered, so what train makes depends on the seed and the number
+ * of games, not on how many cores played them. */
+
+/* What random play shows each agent: which parts of it take few values. */
+typedef struct {
+    Driver dr;
+    Guide *G;
+    int many[MAX_AGENTS][MAX_OBS];
+    double sum[MAX_AGENTS][MAX_OBS], sq[MAX_AGENTS][MAX_OBS];
+    long count[MAX_AGENTS], positions;
+} GSeen;
+
+static int gseen_decide(Driver *dr, VM *vm, int agent, const double *obs, int obs_len,
+                        int n_act, uint32_t legal, const double *probs) {
+    GSeen *W = (GSeen *)dr;
+    (void)vm; (void)n_act; (void)legal; (void)probs;
+    int k = W->G->net_of[agent];
+    GNet *n = W->G->net[k];
+    for (int d = 0; d < n->obs_dim; d++) {
+        double v = d < obs_len ? obs[d] : 0.0;
+        W->sum[k][d] += v;
+        W->sq[k][d] += v * v;
+        if (W->many[k][d]) continue;
+        int j = 0;
+        while (j < n->nv[d] && n->val[d][j] != v) j++;
+        if (j < n->nv[d]) continue;
+        if (n->nv[d] < GUIDE_ONEHOT) n->val[d][n->nv[d]++] = v;
+        else W->many[k][d] = 1;
+    }
+    W->count[k]++;
+    W->positions++;
+    return DRIVE_PASS;
+}
+
+static int cmp_double(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* A new network for this world, its inputs settled by random play. */
+static Guide *guide_new(const Program *p, int horizon, uint64_t seed, int hid) {
+    Guide *G = (Guide *)xcalloc(1, sizeof(Guide));
+    int same = 1;
+    for (int a = 1; a < p->nagents; a++)
+        if (p->agents[a].obs_dim != p->agents[0].obs_dim || p->agents[a].n_act != p->agents[0].n_act)
+            same = 0;
+    G->nnets = same ? 1 : p->nagents;
+    for (int a = 0; a < p->nagents; a++) G->net_of[a] = same ? 0 : a;
+    for (int k = 0; k < G->nnets; k++) {
+        GNet *n = (GNet *)xcalloc(1, sizeof(GNet));
+        n->obs_dim = p->agents[k].obs_dim;
+        n->nact = p->agents[k].n_act;
+        n->nval = p->nagents;
+        n->hid = hid < 1 ? 1 : hid > GUIDE_MAX_HID ? GUIDE_MAX_HID : hid;
+        n->shared = same && p->nagents > 1;
+        G->net[k] = n;
+    }
+    GSeen *W = (GSeen *)xcalloc(1, sizeof(GSeen));
+    W->dr.decide = gseen_decide;
+    W->G = G;
+    State *s = (State *)xmalloc(sizeof(State));
+    VM *vm = (VM *)xmalloc(sizeof(VM));
+    vm_init(vm, p, s);
+    vm->driver = &W->dr;
+    double most = 0.0, ret[MAX_AGENTS], t0 = now_sec();
+    for (long e = 0; e < 4000 && W->positions < 40000 && now_sec() - t0 < 2.0; e++) {
+        run_episode(vm, NULL, NULL, mix64(seed + 0x6E7ULL, (uint64_t)e), 0, (int)e, ret, horizon);
+        for (int a = 0; a < p->nagents; a++)
+            if (fabs(ret[a]) > most) most = fabs(ret[a]);
+    }
+    G->vscale = most > 1e-9 ? most : 1.0;
+    uint64_t rng[4];
+    rng_seed(rng, seed ^ 0x6E7C0DEULL);
+    for (int k = 0; k < G->nnets; k++) {
+        GNet *n = G->net[k];
+        for (int d = 0; d < n->obs_dim; d++) {
+            if (W->many[k][d] || W->count[k] == 0) {
+                double c = W->count[k] > 0 ? (double)W->count[k] : 1.0;
+                double m = W->sum[k][d] / c, var = W->sq[k][d] / c - m * m;
+                n->nv[d] = 0;
+                n->mean[d] = m;
+                n->scale[d] = var > 1e-18 ? sqrt(var) : 1.0;
+            } else {
+                qsort(n->val[d], (size_t)n->nv[d], sizeof(double), cmp_double);
+            }
+        }
+        gnet_layout(n);
+        n->w = (double *)xcalloc((size_t)n->total, sizeof(double));
+        n->g = (double *)xcalloc((size_t)n->total, sizeof(double));
+        n->m = (double *)xcalloc((size_t)n->total, sizeof(double));
+        n->v = (double *)xcalloc((size_t)n->total, sizeof(double));
+        int H = n->hid;
+        double r1 = sqrt(6.0 / (n->obs_dim + n->shared + 1.0)), r2 = sqrt(6.0 / H);
+        for (int i = 0; i < n->nin * H; i++) n->w[n->o_w1 + i] = (rng_double(rng) * 2 - 1) * r1;
+        for (int i = 0; i < H * H; i++) n->w[n->o_w2 + i] = (rng_double(rng) * 2 - 1) * r2;
+        for (int i = 0; i < n->nact * H; i++) n->w[n->o_wp + i] = (rng_double(rng) * 2 - 1) * 0.01;
+        for (int i = 0; i < n->nval * H; i++) n->w[n->o_wv + i] = (rng_double(rng) * 2 - 1) * 0.01;
+    }
+    free(vm); free(s); free(W);
+    return G;
+}
+
+/* Gradient of one decision: cross-entropy to where the search spent its
+ * playouts, and squared error to what each agent went on to collect. */
+static void gnet_backward(GNet *n, const GPass *ps, int n_act, uint32_t legal, const float *pi,
+                          const double *z) {
+    const int H = n->hid;
+    const double *w = n->w;
+    double *g = n->g;
+    double d2[GUIDE_MAX_HID], d1[GUIDE_MAX_HID];
+    memset(d2, 0, sizeof(double) * (size_t)H);
+    for (int a = 0; a < n_act; a++) {
+        if (!((legal >> a) & 1u)) continue;
+        double d = ps->probs[a] - pi[a];
+        g[n->o_bp + a] += d;
+        double *gr = g + n->o_wp + (size_t)a * H;
+        const double *wr = w + n->o_wp + (size_t)a * H;
+        for (int i = 0; i < H; i++) { gr[i] += d * ps->h2[i]; d2[i] += d * wr[i]; }
+    }
+    for (int j = 0; j < n->nval; j++) {
+        double d = ps->value[j] - z[j];
+        g[n->o_bv + j] += d;
+        double *gr = g + n->o_wv + (size_t)j * H;
+        const double *wr = w + n->o_wv + (size_t)j * H;
+        for (int i = 0; i < H; i++) { gr[i] += d * ps->h2[i]; d2[i] += d * wr[i]; }
+    }
+    memset(d1, 0, sizeof(double) * (size_t)H);
+    for (int i = 0; i < H; i++) {
+        if (ps->h2[i] <= 0) continue;
+        double d = d2[i];
+        g[n->o_b2 + i] += d;
+        double *gr = g + n->o_w2 + (size_t)i * H;
+        const double *wr = w + n->o_w2 + (size_t)i * H;
+        for (int j = 0; j < H; j++) { gr[j] += d * ps->h1[j]; d1[j] += d * wr[j]; }
+    }
+    for (int i = 0; i < H; i++) {
+        if (ps->h1[i] <= 0) d1[i] = 0.0;
+        g[n->o_b1 + i] += d1[i];
+    }
+    for (int k = 0; k < ps->n; k++) {
+        double *gr = g + n->o_w1 + (size_t)ps->idx[k] * H;
+        double xv = ps->x[k];
+        for (int i = 0; i < H; i++) gr[i] += xv * d1[i];
+    }
+}
+
+static void gnet_adam(GNet *n, double lr, double scale, double decay) {
+    n->opt_step++;
+    const double b1 = 0.9, b2 = 0.999, eps = 1e-8;
+    double c1 = 1.0 - pow(b1, (double)n->opt_step), c2 = 1.0 - pow(b2, (double)n->opt_step);
+    for (int i = 0; i < n->total; i++) {
+        double g = n->g[i] * scale;
+        n->m[i] = b1 * n->m[i] + (1 - b1) * g;
+        n->v[i] = b2 * n->v[i] + (1 - b2) * g * g;
+        n->w[i] -= lr * ((n->m[i] / c1) / (sqrt(n->v[i] / c2) + eps) + decay * n->w[i]);
+        n->g[i] = 0.0;
+    }
+}
+
+/* `steps` minibatches drawn from the decisions kept; the mean losses of the
+ * last of them go to loss[0] (policy) and loss[1] (value). */
+static void guide_learn(Guide *G, const GBuf *buf, long steps, int batch, double lr,
+                        uint64_t rng[4], double *loss) {
+    GPass ps;
+    long seen[MAX_AGENTS];
+    double lp = 0.0, lv = 0.0;
+    long nl = 0;
+    for (long st = 0; st < steps && buf->n > 0; st++) {
+        memset(seen, 0, sizeof(seen));
+        for (int b = 0; b < batch; b++) {
+            const GSample *x = &buf->d[(long)(rng_double(rng) * buf->n)];
+            int k = G->net_of[x->agent];
+            GNet *n = G->net[k];
+            double z[MAX_AGENTS];
+            for (int a = 0; a < n->nval; a++) z[a] = x->z[a] / G->vscale;
+            gnet_encode(n, x->agent, x->obs, x->obs_len, &ps);
+            gnet_forward(n, &ps, x->n_act, x->legal);
+            gnet_backward(n, &ps, x->n_act, x->legal, x->pi, z);
+            seen[k]++;
+            if (st >= steps - 8) {
+                for (int a = 0; a < x->n_act; a++)
+                    if (x->pi[a] > 0) lp -= x->pi[a] * log(ps.probs[a] > 1e-12 ? ps.probs[a] : 1e-12);
+                for (int a = 0; a < n->nval; a++) lv += (ps.value[a] - z[a]) * (ps.value[a] - z[a]);
+                nl++;
+            }
+        }
+        for (int k = 0; k < G->nnets; k++)
+            if (seen[k]) gnet_adam(G->net[k], lr, 1.0 / (double)seen[k], 1e-4);
+    }
+    loss[0] = nl ? lp / nl : 0.0;
+    loss[1] = nl ? lv / nl : 0.0;
+}
+
+/* One game of self-play; its decisions are added to `buf`. */
+static void selfplay_game(const Program *p, VM *vm, Search *S, int horizon, uint64_t seed,
+                          long game, GBuf *buf) {
+    State *s = vm->s;
+    long first = buf->n;
+    state_reset(p, s, mix64(seed ^ 0x5E1F9A7EULL, (uint64_t)game));
+    s->ep = game;
+    S->game = game;
+    S->moves = 0;
+    S->rec = buf;
+    memset(S->ep_paid, 0, sizeof(S->ep_paid));
+    vm_run(vm, p->init_entry);
+    while (!s->done && s->step < horizon) {
+        vm_step(vm);
+        for (int a = 0; a < p->nagents; a++) S->ep_paid[a] += vm->agent_reward[a];
+    }
+    for (long k = first; k < buf->n; k++)
+        for (int a = 0; a < p->nagents; a++) buf->d[k].z[a] = S->ep_paid[a] - buf->d[k].z[a];
+}
+
+static int cmp_sample(const void *a, const void *b) {
+    const GSample *x = (const GSample *)a, *y = (const GSample *)b;
+    if (x->game != y->game) return x->game < y->game ? -1 : 1;
+    return (x->ply > y->ply) - (x->ply < y->ply);
+}
+
+static void selfplay_games(const Program *p, Search *S, int horizon, uint64_t seed, long first,
+                           long games, long stride, GBuf *buf) {
+    State *s = (State *)xmalloc(sizeof(State));
+    VM *vm = (VM *)xmalloc(sizeof(VM));
+    vm_init(vm, p, s);
+    vm->search = S;
+    for (long g = first; g < first + games; g += stride)
+        selfplay_game(p, vm, S, horizon, seed, g, buf);
+    free(vm); free(s);
+}
+
+#define MAX_CORES 256
+#define GUIDE_TRAIN_SEC 600.0   /* how long train plays itself unless told */
+#define GUIDE_EXPLORE   1.5     /* PUCT's constant, with values scaled to the range seen */
+#define GUIDE_ROLLOUT   0.5     /* a leaf's value: this share one random playout, the rest the network */
+
+static int cores_online(void) {
+#ifdef _SC_NPROCESSORS_ONLN
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n < 1 ? 1 : n > MAX_CORES ? MAX_CORES : (int)n;
+#else
+    return 1;
+#endif
+}
+
+/* Games first .. first + games - 1, on up to `cores` processes. */
+static void selfplay_round(const Program *p, Search *S, int horizon, uint64_t seed, long first,
+                           long games, int cores, GBuf *buf) {
+    long start = buf->n;
+    if (cores > games) cores = (int)games;
+    if (cores > MAX_CORES) cores = MAX_CORES;
+    if (cores <= 1) {
+        selfplay_games(p, S, horizon, seed, first, games, 1, buf);
+        return;
+    }
+    FILE *tf[MAX_CORES];
+    pid_t pid[MAX_CORES];
+    fflush(NULL);
+    for (int w = 0; w < cores; w++) {
+        tf[w] = tmpfile();
+        if (!tf[w]) fatal(1, "hunch-vm: no temporary file for self-play: %s", strerror(errno));
+        pid[w] = fork();
+        if (pid[w] < 0) fatal(1, "hunch-vm: cannot start a self-play process: %s", strerror(errno));
+        if (pid[w] == 0) {
+            GBuf mine = {NULL, 0, 0};
+            selfplay_games(p, S, horizon, seed, first + w, games - w, cores, &mine);
+            int ok = fwrite(&mine.n, sizeof(long), 1, tf[w]) == 1 &&
+                     (mine.n == 0 || fwrite(mine.d, sizeof(GSample), (size_t)mine.n, tf[w]) ==
+                                         (size_t)mine.n) &&
+                     fflush(tf[w]) == 0;
+            _exit(ok ? 0 : 1);
+        }
+    }
+    int failed = 0;
+    for (int w = 0; w < cores; w++) {
+        int status = 0;
+        if (waitpid(pid[w], &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+            failed = 1;
+        long n = 0;
+        rewind(tf[w]);
+        if (!failed && fread(&n, sizeof(long), 1, tf[w]) == 1 && n >= 0) {
+            if (buf->n + n > buf->cap) {
+                while (buf->n + n > buf->cap) buf->cap = buf->cap ? buf->cap * 2 : 1024;
+                buf->d = (GSample *)xrealloc(buf->d, sizeof(GSample) * (size_t)buf->cap);
+            }
+            if (fread(buf->d + buf->n, sizeof(GSample), (size_t)n, tf[w]) != (size_t)n) failed = 1;
+            else buf->n += n;
+        } else {
+            failed = 1;
+        }
+        fclose(tf[w]);
+    }
+    if (failed) fatal(1, "hunch-vm: a self-play process failed");
+    qsort(buf->d + start, (size_t)(buf->n - start), sizeof(GSample), cmp_sample);
+}
+
+typedef struct {
+    long games;         /* stop after this many (rounded up to whole rounds); <= 0: no limit */
+    double seconds;     /* or after this long, checked between rounds */
+    int cores, round, playouts, hid, sample_moves, batch;
+    long window;        /* decisions kept to learn from: the most recent */
+    double reuse;       /* times each decision is drawn into a minibatch, on average */
+    double lr, noise, explore;
+} Learn;
+
+/* Self-play until the games or the time run out; the network it made. */
+static Guide *guide_train(const Program *p, int horizon, uint64_t seed, int hidden,
+                          const Learn *L) {
+    double t0 = now_sec();
+    Guide *G = guide_new(p, horizon, seed, L->hid);
+    Search *T = search_new(p, L->playouts, L->explore, hidden);
+    T->horizon = horizon;
+    T->guide = G;
+    T->selfplay = 1;
+    T->noise = L->noise;
+    T->sample_moves = L->sample_moves;
+    GBuf buf = {NULL, 0, 0};
+    uint64_t rng[4];
+    rng_seed(rng, seed ^ 0x7EA4C4E5ULL);
+    long games = 0, samples = 0;
+    int round = L->round < 1 ? 1 : L->round;
+    while ((L->games <= 0 || games < L->games) && (games == 0 || now_sec() - t0 < L->seconds)) {
+        long before = buf.n;
+        selfplay_round(p, T, horizon, seed, games, round, L->cores, &buf);
+        long fresh = buf.n - before;
+        /* what the first agent collected, and how many games nobody won */
+        double first = 0.0;
+        long played = 0, even = 0;
+        for (long k = before; k < buf.n; k++) {
+            const GSample *x = &buf.d[k];
+            if (x->ply != 0) continue;
+            int zero = 1;
+            for (int a = 0; a < p->nagents; a++) zero &= x->z[a] == 0.0;
+            first += x->z[0];
+            even += zero;
+            played++;
+        }
+        games += round;
+        samples += fresh;
+        G->rounds++;
+        if (buf.n > L->window) {
+            long drop = buf.n - L->window;
+            memmove(buf.d, buf.d + drop, sizeof(GSample) * (size_t)(buf.n - drop));
+            buf.n -= drop;
+        }
+        long steps = (long)ceil((double)fresh * L->reuse / L->batch);
+        double loss[2];
+        guide_learn(G, &buf, steps, L->batch, L->lr, rng, loss);
+        if (g_progress)
+            fprintf(stderr, "games %ld %.1f %.6f %.6f %.6f %.6f\n", games, now_sec() - t0,
+                    played ? first / played : 0.0, played ? (double)even / played : 0.0,
+                    loss[0], loss[1]);
+    }
+    T->guide = NULL;
+    search_free(T);
+    free(buf.d);
+    /* only play needs the weights */
+    for (int k = 0; k < G->nnets; k++) {
+        GNet *n = G->net[k];
+        free(n->g); free(n->m); free(n->v);
+        n->g = n->m = n->v = NULL;
+    }
+    G->games = games;
+    G->samples = samples;
+    G->sec = now_sec() - t0;
+    G->cores = L->cores;
+    G->playouts = L->playouts;
+    return G;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2875,7 +3677,7 @@ static int policy_load(const char *path, const Program *p, Policy *pol) {
         return pol->tab != NULL;
     }
     if (strcmp(tag, "HUNCHSEARCH") == 0) {
-        pol->search = version == 1 ? load_search(f, p) : NULL;
+        pol->search = version == 1 || version == 2 ? load_search(f, p, version) : NULL;
         fclose(f);
         return pol->search != NULL;
     }
@@ -3672,6 +4474,14 @@ static int eval_until(const Program *p, const Policy *pol, uint32_t random_agent
     return n;
 }
 
+/* How a search's network was made, or null when it has none. */
+static void json_guide(FILE *f, const Guide *G) {
+    if (!G) { fputs("null", f); return; }
+    fprintf(f, "{\"games\":%ld,\"decisions\":%ld,\"rounds\":%ld,\"sec\":%.3f,\"cores\":%d,"
+            "\"selfplay_playouts\":%d,\"width\":%d,\"inputs\":%d}", G->games, G->samples,
+            G->rounds, G->sec, G->cores, G->playouts, G->net[0]->hid, G->net[0]->nin);
+}
+
 /* A search cannot be weighed over every outcome: each of its decisions is
  * thousands of playouts, and it has no table to read. It is sampled, and
  * since an episode of it takes seconds, for a set time (--score-sec, 15 s
@@ -3713,9 +4523,11 @@ static int report_search(const Program *p, const Policy *pol, int horizon, uint6
     json_str(f, p->world);
     fprintf(f, ",\"horizon\":%d,\"exact\":false,\"why\":\"search\",\"limit\":0,", horizon);
     fprintf(f, "\"search\":{\"playouts\":%d,\"explore\":%.9g,\"hidden\":\"%s\","
-            "\"positions\":%ld,\"repeats\":%ld,\"distinct\":%ld,\"conflicts\":%ld},",
-            S->playouts, S->explore, HIDDEN_NAME[S->hidden], S->checked[0], S->checked[1],
-            S->checked[2], S->checked[3]);
+            "\"positions\":%ld,\"repeats\":%ld,\"distinct\":%ld,\"conflicts\":%ld,"
+            "\"guide\":", S->playouts, S->explore, HIDDEN_NAME[S->hidden], S->checked[0],
+            S->checked[1], S->checked[2], S->checked[3]);
+    json_guide(f, S->guide);
+    fprintf(f, ",\"rollout\":%.9g},", S->guide ? S->mix : 1.0);
     fprintf(f, "\"episodes\":%d,\"score_sec\":%.9g,", n_all, seconds);
     fputs("\"return\":", f); json_vec(f, ev.mean, nag);
     fputs(",\"sem\":", f); json_vec(f, ev.sem, nag);
@@ -3906,8 +4718,10 @@ static int why_search(const Program *p, const Policy *pol, int horizon, uint64_t
     fputs("{\"world\":", f);
     json_str(f, p->world);
     fprintf(f, ",\"seed\":%llu,\"search\":{\"playouts\":%d,\"explore\":%.9g,"
-            "\"hidden\":\"%s\"},\"decisions\":[", (unsigned long long)seed,
+            "\"hidden\":\"%s\",\"guide\":", (unsigned long long)seed,
             pol->search->playouts, pol->search->explore, HIDDEN_NAME[pol->search->hidden]);
+    json_guide(f, pol->search->guide);
+    fprintf(f, ",\"rollout\":%.9g},\"decisions\":[", pol->search->guide ? pol->search->mix : 1.0);
     int first = 1;
     for (int t = 0; t < horizon && !s->done; t++) {
         vm->record = 1;
@@ -5181,6 +5995,9 @@ int main(int argc, char **argv) {
         long checked[4] = {0, 0, 0, 0};
         int playouts = 0;
         double playouts_sec = 0.0, think = 0.0, explore = 0.0;
+        Learn learn;
+        memset(&learn, 0, sizeof(learn));
+        Guide *guide = NULL;
         /* auto: the exact answer when the world is small enough to follow
          * whole; failing that, a search at play time when sampling finds
          * nothing hidden from the agents; failing that, a network for one
@@ -5268,11 +6085,35 @@ int main(int argc, char **argv) {
              * seconds (a tenth by default) is written to the file, so the
              * policy plays the same on any machine. --playouts sets it. */
             if (hidden < 0) hidden = shown_check(&p, horizon, seed, checked);
-            explore = arg_double(argc, argv, "--explore", 1.0);
+            /* The network is made first (unless --games 0), by self-play, and
+             * the playouts a decision are measured with it. */
+            learn.games = arg_long(argc, argv, "--games", 0);
+            /* a count of games alone has no time limit */
+            learn.seconds = arg_double(argc, argv, "--train-sec",
+                                       learn.games > 0 ? HUGE_VAL : GUIDE_TRAIN_SEC);
+            learn.cores = (int)arg_long(argc, argv, "--cores", 0);
+            if (learn.cores < 1) learn.cores = cores_online();
+            /* Self-play leaves the random playouts of a leaf out: it plays
+             * more games that way, and learned no better with them. */
+            learn.round = 64;
+            learn.playouts = 200;
+            learn.hid = 64;
+            learn.sample_moves = 6;
+            learn.batch = 64;
+            learn.window = 100000;
+            learn.reuse = 4.0;
+            learn.lr = 1e-3;
+            learn.noise = 0.25;
+            int learning = !(learn.games == 0 && arg_value(argc, argv, "--games", NULL)) &&
+                           learn.seconds > 0;
+            explore = arg_double(argc, argv, "--explore", learning ? GUIDE_EXPLORE : 1.0);
+            if (!(explore >= 0.0)) explore = learning ? GUIDE_EXPLORE : 1.0;
+            learn.explore = explore;
+            if (learning) guide = guide_train(&p, horizon, seed, hidden, &learn);
             think = arg_double(argc, argv, "--think", 0.1);
             if (!(think > 0.0)) think = 0.1;
-            if (!(explore >= 0.0)) explore = 1.0;
-            playouts_sec = search_measure(&p, horizon, explore, seed, 0.02, 48, 1.0);
+            playouts_sec = search_measure(&p, horizon, explore, seed, 0.02, 48, 1.0, guide,
+                                          GUIDE_ROLLOUT);
             playouts = (int)arg_long(argc, argv, "--playouts", 0);
             if (playouts < 1) {
                 double want = playouts_sec > 0 ? playouts_sec * think : 1000.0;
@@ -5283,7 +6124,10 @@ int main(int argc, char **argv) {
             }
             Search *S = search_new(&p, playouts, explore, hidden);
             memcpy(S->checked, checked, sizeof(checked));
+            S->guide = guide;
+            if (guide) S->mix = GUIDE_ROLLOUT;
             if (outpath) save_search(outpath, &p, S);
+            S->guide = NULL;        /* still wanted for --json below */
             search_free(S);
             steps = 0;
             final_ret = 0.0;        /* not measured: see the report */
@@ -5328,6 +6172,11 @@ int main(int argc, char **argv) {
                        "\"explore\":%.9g", is_auto ? "true" : "false", playouts, playouts_sec,
                        think, arg_long(argc, argv, "--playouts", 0) >= 1 ? "true" : "false",
                        explore);
+            if (strcmp(algo, "mcts") == 0) {
+                printf(",\"learned\":");
+                json_guide(stdout, guide);
+                printf(",\"rollout\":%.9g", guide ? GUIDE_ROLLOUT : 1.0);
+            }
             if (whole == 3) printf(",\"proven\":%s", proven ? "true" : "false");
             if (strcmp(algo, "regret") == 0)
                 printf(",\"method\":\"%s\",\"iterations\":%ld,\"situations\":%ld,"
@@ -5350,6 +6199,7 @@ int main(int argc, char **argv) {
         }
         for (int i = 0; i < MAX_AGENTS; i++) net_free(nets[i]);
         free(curve.pts);
+        guide_free(guide);
         return 0;
     }
 

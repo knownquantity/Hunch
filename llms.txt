@@ -287,16 +287,29 @@ When the world cannot be followed whole, `train` first checks by sampling
 whether anything is hidden from the agents: it plays random episodes and
 looks for one thing shown to an agent in two different instants of the world.
 
-- **Nothing hidden was found** (a board game such as Connect Four): the policy
-  is a search (`mcts`). Nothing is learned ahead of time. At each decision the
-  policy forks the world from that instant, plays every action out many times
-  (Monte Carlo tree search with random playouts), and plays the action tried
-  most. `train` measures how fast this world is searched on this machine,
-  picks the playouts per decision so that one takes about `--think` seconds
-  (default 0.1), and saves that count in the `.hpol`; `--playouts N` sets it
-  directly. The same instant always gets the same action. The check is
-  evidence, not proof: it needs at least 1,000 repeated observations, all
-  consistent, before it says nothing is hidden.
+- **Nothing hidden was found** (a board game such as Connect Four): the
+  policy is a search (`mcts`) that learns by playing itself, in the manner
+  of AlphaZero. At each decision the policy forks the world from that
+  instant, tries every action many times (Monte Carlo tree search), and
+  plays the action tried most. A small network guides it: it says which
+  actions to try first and what each agent will collect from a position.
+  Where a playout reaches a position the search has not met, the value there
+  is half the network's estimate and half one random playout from it.
+  `train` makes that network by self-play for `--train-sec` seconds (default
+  600, on every core; `--cores N` uses fewer): the search plays games
+  against itself, the network learns from them where the search spent its
+  playouts and how each game ended, and the next games are played with the
+  better network. On Connect Four it got stronger up to about ten minutes on
+  4 cores, and no stronger at thirty. `--games N` plays N games instead of a
+  time; `--games 0` makes no network, and the search then plays every line
+  out at random. What train makes depends on the seed and the number of
+  games, not on the cores. `train` then measures how fast this world is
+  searched on this machine, picks the playouts per decision so that one
+  takes about `--think` seconds (default 0.1), and saves that count and the
+  network in the `.hpol`; `--playouts N` sets the count directly. The same
+  instant always gets the same action. The check is evidence, not proof: it
+  needs at least 1,000 repeated observations, all consistent, before it says
+  nothing is hidden.
 - **Something is hidden, or observations never repeat, one agent**: `ppo`, a
   32x32 network, `--budget` environment steps (default 200,000).
 - **Something is hidden, or observations never repeat, several agents**:
@@ -308,7 +321,8 @@ something is hidden the report says that the policy sees what its agent is
 not shown. A search policy cannot be scored exactly: the report plays it for a
 few seconds and gives standard errors (`--score-sec S` plays for longer), and
 `hunch why` shows, for each decision of an episode, how many playouts tried
-each action and what they saw on average.
+each action and what they saw on average (with a network, the network's
+estimate where a playout stopped).
 
 Other values of `--algo`: `regret`, `ppo`, `mcts`, `fork` (PPO plus a replay
 of selected decisions once per action under the same random numbers),
@@ -365,7 +379,7 @@ the commands take a name in place of a file (`hunch train kuhn`).
     saved = hunch.Policy(world, "kuhn.hpol") # a policy file from an earlier run
 
 `world.train(out=PATH, target=G, max_sec=S, seed=N, algo=A, budget=N, think=S,
-playouts=N)` takes what `hunch train` takes. Wherever a policy is wanted
+playouts=N, train_sec=S, games=N, cores=N)` takes what `hunch train` takes. Wherever a policy is wanted
 (`policy=`, `against=`), a `Policy` or the path of a `.hpol` works.
 
     env = world.env(agents=["alice"], policy=solved)   # you decide alice; the rest play
@@ -499,6 +513,7 @@ value)}` from the last call.
     hunch train <file> [--algo A] [--budget N] [--seed N] [--out p.hpol]
                        [--target G] [--max-sec S] [--exact-nodes N] [--json]
                        [--think SECONDS | --playouts N] [--score-sec S]   (a search policy)
+                       [--train-sec S | --games N] [--cores N]   (its self-play)
     hunch score <file> [--policy p] [--score-sec S]   the report for a saved policy, without training
     hunch run <file> [--seed N] [--episodes N] [--json]
     hunch run <file> --agent hero --actions up,up,left   script one agent, by name or number;

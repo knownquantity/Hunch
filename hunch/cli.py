@@ -209,10 +209,12 @@ def find_policy(args, path: Path):
 
 def search_header(policy) -> dict:
     """The fields of a policy file that is a search (`HUNCHSEARCH 1`: world,
-    playouts, explore, hidden, checked); {} for a table, networks or no file."""
+    playouts, explore, hidden, checked; version 2 adds `rollout` and `guide`
+    lines, for the network the search learned by self-play); {} for a table,
+    networks or no file."""
     try:
         with open(policy) as f:
-            lines = [f.readline().split() for _ in range(6)]
+            lines = [f.readline().split() for _ in range(8)]
     except (OSError, TypeError, UnicodeDecodeError):
         return {}
     if not lines[0] or lines[0][0] != "HUNCHSEARCH":
@@ -230,6 +232,8 @@ def policy_words(policy) -> str:
         words = f"policy {policy} (a search, {int(head['playouts'][0]):,} playouts a decision"
     except (KeyError, IndexError, ValueError):
         return f"policy {policy} (a search)"
+    if "guide" in head:
+        words += ", guided by a network it trained by playing itself"
     if head.get("hidden") == ["found"]:
         words += "; it looks at the whole state, including what its agent is not shown"
     return words + ")"
@@ -694,7 +698,8 @@ def cmd_train(args) -> int:
                         ("--fork-ratio", args.fork_ratio), ("--rollout", args.rollout),
                         ("--target", args.target), ("--max-sec", args.max_sec),
                         ("--think", args.think), ("--playouts", args.playouts),
-                        ("--exact-nodes", exact_nodes)):
+                        ("--games", args.games), ("--train-sec", args.train_sec),
+                        ("--cores", args.cores), ("--exact-nodes", exact_nodes)):
         if value is not None:
             cmd += [flag, str(value)]
     quiet = args.json or not unit["agents"]
@@ -704,8 +709,17 @@ def cmd_train(args) -> int:
                             stderr=subprocess.PIPE, text=True)
     errors = []
     started = time.time()
+    shown = 0.0
     for line in proc.stderr:
         parts = line.split()
+        if len(parts) == 7 and parts[0] == "games":
+            # self-play: a line every half minute or so
+            sec = float(parts[2])
+            if quiet or sec - shown < SELFPLAY_EVERY:
+                continue
+            shown = sec
+            print(f"  {int(parts[1]):>8,} games of self-play  ({show.clock(sec)})", flush=True)
+            continue
         if len(parts) == 3 and parts[0] in ("step", "gap"):
             # Progress is for runs long enough to wonder about.
             if quiet or time.time() - started < 1.0:
@@ -751,6 +765,7 @@ def cmd_train(args) -> int:
 
 ALGOS = ["auto", "regret", "mcts", "ppo", "fork", "reinforce", "random"]
 TRAIN_SCORE_SEC = 5.0       # how long `train` plays a search to score it; `score` takes 15 s
+SELFPLAY_EVERY = 30.0       # seconds between the progress lines of self-play
 
 
 def cmd_studio(args) -> int:
@@ -795,6 +810,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="mcts: playouts per decision are chosen to take about this long on "
                          "this machine (default 0.1), then saved in the policy")
     sp.add_argument("--playouts", type=int, help="mcts: playouts per decision, set directly")
+    sp.add_argument("--train-sec", type=float, metavar="SECONDS",
+                    help="mcts: how long the search plays itself to train the network that "
+                         "guides it (default 600)")
+    sp.add_argument("--games", type=int,
+                    help="mcts: games of self-play, instead of a time (rounded up to rounds of "
+                         "64); 0 for no network, a search with random playouts")
+    sp.add_argument("--cores", type=int,
+                    help="mcts: processes that play self-play games at once (default: every core)")
     sp.add_argument("--score-sec", type=float, metavar="SECONDS",
                     help="mcts: how long the search is played to score it (default 5)")
     sp.add_argument("--budget", type=int,

@@ -495,7 +495,7 @@ def test_trained_search_never_loses_tictactoe():
     t = world("tictactoe")
     solved = t.train(out=TMP / "ttt-solved.hpol")
     assert solved.method == "lookahead"
-    tr = train_vm(t, TMP / "ttt-search.hpol", "--algo", "mcts")
+    tr = train_vm(t, TMP / "ttt-search.hpol", "--algo", "mcts", "--games", "0")
     assert tr["method"] == "mcts" and tr["hidden"] == "nothing", tr
     search = hunch.Policy(t, TMP / "ttt-search.hpol")
     rng = random.Random(5)
@@ -524,7 +524,7 @@ def test_trained_search_never_loses_tictactoe():
     except hunch.HunchRuntimeError as exc:
         assert "search" in str(exc), exc
     # World.train reports it the way the command does.
-    got = t.train(algo="mcts", out=TMP / "ttt-quick.hpol", playouts=300, score_sec=0.5)
+    got = t.train(algo="mcts", out=TMP / "ttt-quick.hpol", playouts=300, score_sec=0.5, games=0)
     assert got.method == "mcts" and not got.exact and got.nashconv is None, got.train
     assert "the policy is a search" in str(got) and "300 playouts a decision" in str(got), str(got)
 
@@ -534,7 +534,7 @@ def test_trained_search_wins_connect_four():
     play from either seat. (--exact-nodes only makes "too big" quick to find
     out; the choice and the playouts are train's own.)"""
     c = world("connect4")
-    tr = train_vm(c, TMP / "c4.hpol", "--algo", "auto", "--exact-nodes", "50000")
+    tr = train_vm(c, TMP / "c4.hpol", "--algo", "auto", "--exact-nodes", "50000", "--games", "0")
     assert tr["method"] == "mcts" and tr["chosen"] is True and tr["hidden"] == "nothing", tr
     rng = random.Random(11)
     for mine, theirs in (("first", "second"), ("second", "first")):
@@ -547,6 +547,45 @@ def test_trained_search_wins_connect_four():
             wins += env.returns[mine] == 1
         assert wins >= 9, (f"the search ({tr['playouts']} playouts) won only {wins} of 10 "
                            f"as {mine} against random play")
+
+
+def test_learned_search_beats_random_playouts():
+    """At 100 playouts a decision the search with random playouts loses
+    tic-tac-toe as o to the solved policy; after 512 games of self-play the
+    network-guided search, played through the library with no Python in the
+    loop, loses no game in either seat."""
+    t = world("tictactoe")
+    solved = t.train(out=TMP / "ttt-solved.hpol")
+    plain = train_vm(t, TMP / "ttt-plain.hpol", "--algo", "mcts", "--games", "0",
+                     "--playouts", "100")
+    got = t.train(algo="mcts", out=TMP / "ttt-learned.hpol", playouts=100, games=512, cores=2,
+                  score_sec=0.5)
+    assert plain["learned"] is None and got.train["learned"]["games"] == 512, got.train
+    assert "it learned by playing itself" in str(got), str(got)
+
+    def lost(policy, mine, theirs):
+        env = t.env(agents=[theirs], policy=policy)
+        rng = random.Random(5)
+        n = 0
+        for seed in range(1, 25):
+            env.reset(seed)
+            while not env.over:
+                env.act(solved.act(theirs, env.obs, env.legal, rng))
+            n += env.returns[mine] < 0
+        return n
+
+    assert lost(TMP / "ttt-plain.hpol", "o", "x") > 0, "random playouts no longer lose here"
+    for mine, theirs in (("x", "o"), ("o", "x")):
+        assert lost(TMP / "ttt-learned.hpol", mine, theirs) == 0, f"the learned search lost as {mine}"
+    # The same instant gets the same reply.
+    env = t.env(agents=["x"], policy=TMP / "ttt-learned.hpol")
+    env.reset(4)
+    snap = env.snapshot()
+    env.act(env.legal[0])
+    first = env.memory()
+    env.restore(snap)
+    env.act(env.legal[0])
+    assert env.memory() == first, "the learned search answered one instant in two ways"
 
 
 # ---------------------------------------------------------------------------
@@ -677,6 +716,7 @@ def main() -> int:
             ("search plays without training", test_search_plays_without_training),
             ("a trained search never loses tic-tac-toe", test_trained_search_never_loses_tictactoe),
             ("a trained search wins Connect Four", test_trained_search_wins_connect_four),
+            ("a learned search beats random playouts", test_learned_search_beats_random_playouts),
         ]),
         ("bindings", [
             ("vec matches the exact value", test_vec_matches_the_exact_value),

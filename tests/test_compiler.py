@@ -1041,12 +1041,15 @@ def _train_vm(world: Path, pol: Path, *flags) -> dict:
 
 def test_train_makes_a_search_for_connect_four():
     """Connect Four cannot be followed whole and hides nothing, so `auto`
-    saves a search. (--exact-nodes only makes "too big" quick to find out.)"""
+    saves a search. (--exact-nodes only makes "too big" quick to find out;
+    --games 0 leaves out the network, which test_train_learns_to_search
+    covers.)"""
     from hunch import show
     world = ROOT / "worlds" / "connect4.hunch"
     with tempfile.TemporaryDirectory() as d:
         pol = Path(d) / "c4.hpol"
-        tr = _train_vm(world, pol, "--algo", "auto", "--exact-nodes", "50000", "--think", "0.02")
+        tr = _train_vm(world, pol, "--algo", "auto", "--exact-nodes", "50000", "--think", "0.02",
+                       "--games", "0")
         assert tr["algo"] == "mcts" and tr["method"] == "mcts" and tr["chosen"] is True, tr
         assert tr["hidden"] == "nothing" and tr["not_whole"] == "big:50000", tr
         seen = tr["hidden_check"]
@@ -1083,9 +1086,10 @@ def test_search_replays_and_explains():
     world = ROOT / "worlds" / "tictactoe.hunch"
     with tempfile.TemporaryDirectory() as d:
         pol = Path(d) / "t.hpol"
-        tr = _train_vm(world, pol, "--algo", "mcts", "--playouts", "2000")
+        tr = _train_vm(world, pol, "--algo", "mcts", "--playouts", "2000", "--games", "0")
         assert tr["method"] == "mcts" and tr["chosen"] is False and tr["playouts"] == 2000, tr
         assert tr["playouts_set"] is True and tr["hidden"] == "nothing", tr
+        assert tr["learned"] is None, tr
         one = hunch("run", world, "--policy", pol, "--seed", "7")
         two = hunch("run", world, "--policy", pol, "--seed", "7")
         assert one.returncode == 0, one.stderr
@@ -1127,6 +1131,55 @@ def test_search_replays_and_explains():
         assert "playouts   they collected" in text and "taken" in text, text
 
 
+def test_train_learns_to_search():
+    """By default a search learns by playing itself: a network trained on its
+    games guides it. What train makes depends on the seed and the games, not
+    on how many cores played them; the file is all that play needs, and one
+    that does not fit is refused."""
+    from hunch import show
+    world = ROOT / "worlds" / "tictactoe.hunch"
+    with tempfile.TemporaryDirectory() as d:
+        one, two = Path(d) / "one.hpol", Path(d) / "two.hpol"
+        tr = _train_vm(world, one, "--algo", "mcts", "--games", "256", "--cores", "1",
+                       "--playouts", "300")
+        _train_vm(world, two, "--algo", "mcts", "--games", "256", "--cores", "3",
+                  "--playouts", "300")
+        learned = tr["learned"]
+        assert learned["games"] == 256 and learned["rounds"] == 4 and learned["cores"] == 1, tr
+        assert learned["decisions"] > 256 * 4, tr
+        a, b = one.read_text().splitlines(), two.read_text().splitlines()
+        assert a[0] == "HUNCHSEARCH 2" and a[6] == "rollout 0.5" and a[7].startswith("guide "), a[:8]
+        # only the time taken and the cores differ
+        assert [l for l in a if not l.startswith("guide")] == \
+            [l for l in b if not l.startswith("guide")], "the cores changed what was learned"
+        said = show.how_trained(tr)
+        assert "it learned by playing itself" in said and "self-play: 256 games, " in said, said
+        assert "300 playouts a decision, as asked" in said, said
+
+        run = hunch("run", world, "--policy", one, "--seed", "7")
+        assert run.returncode == 0, run.stderr
+        assert run.stdout == hunch("run", world, "--policy", one, "--seed", "7").stdout
+        assert "guided by a network it trained by playing itself" in run.stdout, run.stdout
+        why = hunch_json("why", world, "--policy", one, "--seed", "7", "--json")
+        assert why["search"]["guide"]["games"] == 256, why["search"]
+        for dec in why["decisions"]:
+            assert sum(dec["tries"]) == 300 and dec["tries"][dec["action"]] == max(dec["tries"])
+        text = hunch("why", world, "--policy", one, "--seed", "7").stdout
+        assert "the network" in text and "Nothing was replayed" in text, text
+        text = hunch("score", world, "--policy", one, "--score-sec", "1").stdout
+        assert "guided by the network it trained by playing itself (256 games" in text, text
+
+        # a file cut short, or with weights that are not numbers, is refused
+        cut = Path(d) / "cut.hpol"
+        cut.write_text("\n".join(a[:-3]) + "\n")
+        bad = Path(d) / "bad.hpol"
+        last = a[-1].split()
+        bad.write_text("\n".join(a[:-1] + [" ".join(["nan"] + last[1:])]) + "\n")
+        for pol in (cut, bad):
+            out = hunch("run", world, "--policy", pol)
+            assert out.returncode != 0 and "could not read policy" in out.stderr, out.stderr
+
+
 def test_hidden_information_keeps_its_method():
     """A search reads the whole state, so `auto` picks it only on evidence
     that the agents are shown all of it."""
@@ -1147,7 +1200,8 @@ def test_hidden_information_keeps_its_method():
         assert tr["hidden_check"]["conflicts"] == 0, tr
         assert pol.read_text().startswith("HUNCHPOL 1"), pol.read_text()[:40]
         # Forced, the search is made anyway, and says what it looks at.
-        tr = _train_vm(ROOT / "worlds" / "kuhn.hunch", pol, "--algo", "mcts", "--playouts", "200")
+        tr = _train_vm(ROOT / "worlds" / "kuhn.hunch", pol, "--algo", "mcts", "--playouts", "200",
+                       "--games", "0")
         assert tr["method"] == "mcts" and tr["chosen"] is False and tr["hidden"] == "found", tr
         said = show.how_trained(tr)
         assert "as asked (--algo mcts)" in said, said
@@ -1269,6 +1323,7 @@ def main() -> int:
     for name, fn in [
         ("train makes a search for Connect Four", test_train_makes_a_search_for_connect_four),
         ("a search replays, plays and explains", test_search_replays_and_explains),
+        ("train learns to search by self-play", test_train_learns_to_search),
         ("hidden information keeps its method", test_hidden_information_keeps_its_method),
     ]:
         check(name, fn)

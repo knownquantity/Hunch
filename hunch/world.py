@@ -586,7 +586,8 @@ class World:
               budget: Optional[int] = None, target: Optional[float] = None,
               max_sec: Optional[float] = None, exact_nodes: Optional[int] = None,
               think: Optional[float] = None, playouts: Optional[int] = None,
-              score_sec: Optional[float] = None) -> Trained:
+              score_sec: Optional[float] = None, train_sec: Optional[float] = None,
+              games: Optional[int] = None, cores: Optional[int] = None) -> Trained:
         """Fill the blanks, as `hunch train` does, and return the policy with
         its report. The policy is saved beside the world unless `out` says
         where (`.path` on the result is where it went; for a world that ships
@@ -595,6 +596,9 @@ class World:
         sharper reference to grade against. When the policy is a search
         (`algo="mcts"`, or chosen by "auto"), `think` is the seconds a decision
         is given on this machine and `playouts` sets the count directly;
+        `train_sec` is how long it plays itself to train the network that
+        guides it (default 600), `games` a number of games instead (0: no
+        network), `cores` how many processes play them (default: all);
         `score_sec` is how long it is played to score it (default 5)."""
         if not self.agents:
             raise ValueError(f"{self.name} has no `hunch` blank, so there is nothing to train")
@@ -603,7 +607,8 @@ class World:
         cmd = ["train", self.hbc, "--algo", algo, "--seed", seed, "--out", out, "--json"]
         for flag, value in (("--budget", budget), ("--target", target),
                             ("--max-sec", max_sec), ("--exact-nodes", exact_nodes),
-                            ("--think", think), ("--playouts", playouts)):
+                            ("--think", think), ("--playouts", playouts),
+                            ("--train-sec", train_sec), ("--games", games), ("--cores", cores)):
             if value is not None:
                 cmd += [flag, value]
         train = self._vm(cmd)
