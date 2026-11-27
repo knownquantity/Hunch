@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Docs — Hunch</title>
-<meta name="description" content="The Hunch language reference.">
+<meta name="description" content="Hunch documentation: the one-page language reference, the guides, and the commands.">
 <meta name="color-scheme" content="light">
 <link rel="icon" href="../favicon.ico?v=3" sizes="16x16 32x32 48x48" type="image/x-icon">
 <style>
@@ -16,9 +16,15 @@
   .back { font: 400 12px/1 "IBM Plex Mono", monospace; color: #000; text-decoration: none; border-bottom: 1px solid #000; padding-bottom: 3px; }
   h1 { margin: 40px 0 0; font-size: clamp(30px, 3.2vw, 44px); font-weight: 400; letter-spacing: -.02em; }
   p { margin: 16px 0 0; font-size: 16px; line-height: 1.55; color: #333; }
-  .more { margin-top: 28px; font: 400 12px/1.8 "IBM Plex Mono", monospace; }
-  .more a { color: #000; text-decoration: none; border-bottom: 1px solid #000; padding-bottom: 3px; }
-  .todo { margin-top: 44px; font: 400 11px/1.8 "IBM Plex Mono", monospace; color: #8a8a8a; }
+  h2 { margin: 44px 0 0; font-size: 20px; font-weight: 500; letter-spacing: -.01em; }
+  code { font: 400 .86em "IBM Plex Mono", monospace; }
+  pre { margin: 18px 0 0; padding: 12px 14px; background: #f7f7f5; border: 1px solid #000; border-radius: 2px; font: 400 11.5px/1.75 "IBM Plex Mono", monospace; overflow-x: auto; }
+  .list { list-style: none; margin: 30px 0 0; padding: 0; }
+  .list li { padding: 14px 0; border-top: 1px solid #e3e3df; }
+  .list li:last-child { border-bottom: 1px solid #e3e3df; }
+  .list a { font: 400 13px/1.4 "IBM Plex Mono", monospace; color: #000; text-decoration: none; border-bottom: 1px solid #000; padding-bottom: 2px; }
+  .list a:hover { opacity: .6; }
+  .list span { display: block; margin-top: 8px; font-size: 15px; line-height: 1.5; color: #333; }
   @media (max-width: 900px) { main { padding: 24px; } }
 </style>
 </head>
@@ -26,9 +32,22 @@
 <main>
   <a class="back" href="../">← Hunch</a>
   <h1>Docs</h1>
-  <p>The full reference is being written. Until then, the whole language fits on one page — state, step, <code>hunch(...)</code>, reward, and the four commands.</p>
-  <p class="more"><a href="../llms.txt">One-page reference (llms.txt)</a></p>
-  <p class="todo">Coming: world · state · step · hunch · reward · train · run</p>
+  <p>The whole language fits on one page, so start there. It is written to be pasted into a model's context, and a model that has read it can write a new world.</p>
+
+  <ul class="list">
+    <li><a href="../llms.txt">The language on one page</a><span>The shape of a file, statements, the <code>hunch</code> blank, rewards, what <code>train</code> does, the Python interface, and every command.</span></li>
+    <li><a href="https://github.com/knownquantity/Hunch/blob/main/docs/details.md">Hunch in detail ↗</a><span>A walkthrough of the commands, the method <code>train</code> picks for each kind of world, results checked against known answers, and every limit.</span></li>
+    <li><a href="https://github.com/knownquantity/Hunch/blob/main/docs/python.md">Hunch from Python ↗</a><span>Environments, gymnasium and PettingZoo, forks, and grading any agent against a solved game.</span></li>
+    <li><a href="https://github.com/knownquantity/Hunch/tree/main/worlds">The worlds ↗</a><span>Fourteen files to read and change: Kuhn and Leduc poker, liar's dice, tic-tac-toe, Connect Four, an auction, a dungeon, a cache.</span></li>
+  </ul>
+
+  <h2>Five commands</h2>
+  <pre>hunch test  world.hunch    compile it, show what each agent sees, check its asserts
+hunch train world.hunch    fill the blanks, and say what was found
+hunch run   world.hunch    one episode, step by step
+hunch why   world.hunch    what every other action would have been worth
+hunch play  world.hunch    take a seat and play against it</pre>
+  <p><code>train</code> saves the policy beside the world, and the others pick it up from there. Two more commands are for evaluation: <code>hunch score</code> prints a saved policy's report again, and <code>hunch grade</code> scores an outside agent, such as a script or a language model.</p>
 </main>
 </body>
 </html>

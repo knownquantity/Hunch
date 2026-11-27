@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Studio — Hunch</title>
-<meta name="description" content="Hunch Studio — replay the four trained worlds.">
+<meta name="description" content="Hunch Studio: replay four trained worlds on your own machine.">
 <meta name="color-scheme" content="light">
 <link rel="icon" href="../favicon.ico?v=3" sizes="16x16 32x32 48x48" type="image/x-icon">
 <style>
@@ -26,9 +26,11 @@
 <main>
   <a class="back" href="../">← Hunch</a>
   <h1>Studio</h1>
-  <p>The studio needs the compiled runtime, so it runs locally rather than in the browser. Train a world, then open it:</p>
-  <pre>./bin/hunch train worlds/dungeon.hunch --algo fork --budget 400000
+  <p>The Studio is a page that replays four of the shipped worlds, the dungeon, the market, the duel and the cache, untrained beside trained, and retrains them while you watch. It needs the runtime, so it runs on your machine from a checkout, not in the browser:</p>
+  <pre>git clone https://github.com/knownquantity/Hunch
+cd Hunch
 ./bin/hunch studio</pre>
+  <p>The trained policies for those four worlds come with the checkout. The Studio does not show Connect Four or the search yet.</p>
   <p class="more"><a href="https://github.com/knownquantity/Hunch">Source on GitHub ↗</a></p>
 </main>
 </body>

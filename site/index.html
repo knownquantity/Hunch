@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Hunch</title>
-<meta name="description" content="Zero-dependency language for forkable RL environments">
+<meta name="description" content="Hunch is a self-play-native programming language for RL environments.">
 <link rel="icon" href="favicon.ico?v=3" sizes="16x16 32x32 48x48" type="image/x-icon">
 <link rel="icon" type="image/png" sizes="32x32" href="assets/icon-32.png">
 <link rel="apple-touch-icon" href="assets/icon-180.png">
@@ -13,16 +13,16 @@
 <meta property="og:site_name" content="Hunch">
 <meta property="og:type" content="website">
 <meta property="og:title" content="Hunch">
-<meta property="og:description" content="Zero-dependency language for forkable RL environments">
-<!-- og:image should become absolute once the site has a domain -->
-<meta property="og:image" content="assets/hunch-card-1200x630.png">
+<meta property="og:description" content="Hunch is a self-play-native programming language for RL environments.">
+<meta property="og:url" content="https://hunch.is/">
+<meta property="og:image" content="https://hunch.is/assets/hunch-card-1200x630.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Hunch">
-<meta name="twitter:description" content="Zero-dependency language for forkable RL environments">
-<meta name="twitter:image" content="assets/hunch-card-1200x630.png">
+<meta name="twitter:description" content="Hunch is a self-play-native programming language for RL environments.">
+<meta name="twitter:image" content="https://hunch.is/assets/hunch-card-1200x630.png">
 <meta name="color-scheme" content="light">
 <style>
   @font-face {
@@ -194,13 +194,15 @@
 
   .links {
     display: flex;
-    gap: 26px;
+    flex-wrap: wrap;
+    gap: 14px 26px;
     align-self: flex-start;
     margin-top: 18px;
   }
 
   .repo {
     display: inline-block;
+    white-space: nowrap;
     font: 400 12px/1 var(--mono);
     color: var(--ink);
     text-decoration: none;
@@ -208,6 +210,49 @@
     padding-bottom: 3px;
   }
   .repo:hover { opacity: 0.6; }
+
+  /* ---------- the worked example ---------- */
+
+  .example { margin-top: 64px; max-width: 1180px; }
+
+  .example .desc { max-width: 64ch; }
+
+  .pair {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 24px;
+    align-items: start;
+    margin-top: 22px;
+  }
+
+  .pair figure { margin: 0; min-width: 0; }
+
+  .pair figcaption {
+    margin: 0 0 8px;
+    font: 400 12px/1 var(--mono);
+    color: var(--muted);
+  }
+
+  .listing {
+    margin: 0;
+    padding: 12px 14px;
+    background: var(--panel);
+    border: 1px solid #000;
+    border-radius: 2px;
+    font: 400 11.5px/1.65 var(--mono);
+    color: #1a1b1e;
+    white-space: pre;
+    overflow-x: auto;
+  }
+  .listing.out { white-space: pre-wrap; }
+
+  .listing mark { color: inherit; padding: 1px 0; }
+  .listing mark.blank { background: #ded3f7; }
+  .listing mark.found { background: #fbe3a4; }
+
+  .after { margin: 22px 0 0; font-size: 15px; max-width: 64ch; }
+  .after + .after { margin-top: 12px; }
+  .after a { color: var(--ink); }
 
   /* ---------- the fall ---------- */
 
@@ -239,6 +284,9 @@
       gap: 24px;
     }
     .panel { margin-top: 28px; min-height: 0; }
+    .example { margin-top: 56px; }
+    .pair { grid-template-columns: minmax(0, 1fr); }
+    .listing.out { white-space: pre; }
   }
 </style>
 </head>
@@ -249,26 +297,103 @@
   <div class="art">
     <img src="assets/hunch-card.png?v=2"
          alt="Hunch — a riso-printed grid of cyan, purple and yellow cells forming an H">
-    <div class="overlay" id="overlay" role="navigation" aria-label="Hunch sections"></div>
+    <div class="overlay" id="overlay" role="navigation" aria-label="Quickstart, the language, and Python"></div>
   </div>
 
     <div class="copy">
-      <p class="sentence"><strong>Hunch</strong> is a compiled, <span class="nw">self-play-native</span> programming language for forkable RL environments.</p></div>
+      <p class="sentence"><strong>Hunch</strong> is a <span class="nw">self-play-native</span> programming language for RL environments.</p></div>
   </div>
 
   <div class="panel" id="panel">
       <p class="label" id="label">Quickstart</p>
-      <p class="desc" id="desc">Clone, test a world, train it, then open the studio. Needs python3 and a C compiler.</p>
-    <pre class="codebox" id="code">$ git clone github.com/knownquantity/Hunch
-$ ./bin/hunch test worlds/dungeon.hunch
-$ ./bin/hunch train worlds/dungeon.hunch --algo fork --budget 400000
-$ ./bin/hunch studio</pre>
+      <p class="desc" id="desc">Install it, solve Kuhn poker, ask why it made each move, then take a seat against it. Needs python3 and a C compiler.</p>
+    <pre class="codebox" id="code">$ pip install git+https://github.com/knownquantity/Hunch
+$ hunch train kuhn
+$ hunch why kuhn
+$ hunch play kuhn</pre>
   </div>
 
   <div class="links">
-    <a class="repo" href="llms.txt">One-page reference (llms.txt)</a>
+    <a class="repo" href="docs/">Docs</a>
+    <a class="repo" href="llms.txt">One-page reference</a>
     <a class="repo" href="https://github.com/knownquantity/Hunch">GitHub ↗</a>
   </div>
+
+  <section class="example" aria-labelledby="example-title">
+    <p class="label" id="example-title">One file in, a strategy out</p>
+    <p class="desc">This is all of Kuhn poker, the smallest game in which bluffing is correct. Each highlighted <code>hunch</code> is a decision left blank: who decides, what they are shown, and what they can do. Two names in one file are two agents that learn against each other.</p>
+
+    <div class="pair">
+      <figure>
+        <figcaption>kuhn.hunch: the rules</figcaption>
+        <pre class="listing">world Kuhn
+horizon 3
+
+state {
+  card_a: int = 0;
+  card_b: int = 0;
+  phase: int = 0;       // 0 alice opens, 1 bob faces a bet, 2 bob after a pass,
+                        // 3 alice faces a bet
+}
+
+init {
+  card_a = randint(0, 2);             // two different cards out of 0, 1, 2
+  card_b = randint(0, 1);
+  if card_b &gt;= card_a { card_b = card_b + 1; }
+}
+
+step {
+  let show = -1;                      // +1 if alice holds the higher card
+  if card_a &gt; card_b { show = 1; }
+  let facing_bet = 0;
+  if phase == 1 || phase == 3 { facing_bet = 1; }
+
+  if phase == 0 {
+    let a = <mark class="blank">hunch alice([card_a, facing_bet], [pass, bet])</mark>;
+    if a == bet { phase = 1; } else { phase = 2; }
+  } else if phase == 1 {
+    let b = <mark class="blank">hunch bob([card_b, facing_bet], [pass, bet])</mark>;
+    if b == pass { reward(alice, 1); reward(bob, -1); }
+    else { reward(alice, 2 * show); reward(bob, -2 * show); }
+    done();
+  } else if phase == 2 {
+    let b = <mark class="blank">hunch bob([card_b, facing_bet], [pass, bet])</mark>;
+    if b == pass { reward(alice, show); reward(bob, -show); done(); }
+    phase = 3;
+  } else {
+    let a = <mark class="blank">hunch alice([card_a, facing_bet], [pass, bet])</mark>;
+    if a == pass { reward(alice, -1); reward(bob, 1); }
+    else { reward(alice, 2 * show); reward(bob, -2 * show); }
+    done();
+  }
+}</pre>
+      </figure>
+      <figure>
+        <figcaption>what train found</figcaption>
+        <pre class="listing out">$ hunch train kuhn
+Kuhn: solved by regret matching over every outcome: 58 positions, 12 situations, 453 rounds (0.0s)
+scored exactly: every chance outcome and every action weighed, 58 positions
+
+  alice  collects -0.0556 per episode
+  bob    collects +0.0556 per episode
+  with everyone playing at random:  alice +0.1250, bob -0.1250
+  the most each agent could gain by changing its policy alone: alice 0.0006, bob 0.0002   (NashConv 0.0007)
+
+what alice does  (over all its decisions: pass 71%, bet 29%)
+  card_a  facing_bet   |  pass   bet   |  times per episode
+<mark class="found">       0           0   |   81%   19%   |  0.333</mark>
+       1           0   |  &gt;99%   &lt;1%   |  0.333
+       2           0   |   42%   58%   |  0.333
+       1           1   |   47%   53%   |  0.222
+       0           1   |  &gt;99%   &lt;1%   |  0.134
+       2           1   |   &lt;1%  &gt;99%   |  0.023
+...</pre>
+      </figure>
+    </div>
+
+    <p class="after">That is the textbook answer. The game is worth −1/18 to the first player, and alice bluffs with the lowest card 19% of the time. Nobody wrote “bluff” anywhere.</p>
+    <p class="after">Games up to about two million positions are solved exactly, like this one. Connect Four, at 4.5 trillion, is too big for that, so <code>train</code> gives it a policy that searches at each move, and teaches it by having it play itself for ten minutes. On a 5×4 board, where perfect play is known, the result drew 100 of 100 games against it in each seat. Full Connect Four has not been measured against perfect play. <a href="https://github.com/knownquantity/Hunch/blob/main/docs/details.md#limits">Every limit is written down</a>.</p>
+  </section>
 </main>
 
 <script>
@@ -279,23 +404,23 @@ $ ./bin/hunch studio</pre>
     "ypyppcppc",
     "pcpcpcpcp"
   ];
-  const REGION = { y: 'home', p: 'docs', c: 'studio' };
+  const REGION = { y: 'home', p: 'docs', c: 'python' };
 
   const COPY = {
     home: {
       label: 'Quickstart',
-      desc: 'Clone, test a world, train it, then open the studio. Needs python3 and a C compiler.',
-      code: '$ git clone github.com/knownquantity/Hunch\n$ ./bin/hunch test worlds/dungeon.hunch\n$ ./bin/hunch train worlds/dungeon.hunch --algo fork --budget 400000\n$ ./bin/hunch studio'
+      desc: 'Install it, solve Kuhn poker, ask why it made each move, then take a seat against it. Needs python3 and a C compiler.',
+      code: '$ pip install git+https://github.com/knownquantity/Hunch\n$ hunch train kuhn\n$ hunch why kuhn\n$ hunch play kuhn'
     },
     docs: {
-      label: 'Docs',
-      desc: 'The whole language on one page: state, step, reward, and the hunch blank. Generated from the same source as the cheat sheet.',
-      code: 'world Dungeon\nstate { x: int = 1; y: int = 1; }\nstep {\n  let a = hunch hero([x / 6.0, y / 6.0], 4);\n}'
+      label: 'The language',
+      desc: 'A world is one file: its state, a step, a reward, and a hunch blank wherever something is decided. This one is complete.',
+      code: 'world Walk\nhorizon 10\nstate { x: int = 0; }\nstep {\n  let a = hunch hero([x], [left, right]);\n  if a == right { x = x + 1; } else { x = x - 1; }\n  reward(x);\n}'
     },
-    studio: {
-      label: 'Studio',
-      desc: 'Replay the four trained worlds, step the policy, and fork a decision to see what the other actions were worth.',
-      code: '$ ./bin/hunch studio'
+    python: {
+      label: 'From Python',
+      desc: 'The same file is an environment. Step it, wrap it as gymnasium or PettingZoo, and grade any agent against the solved game.',
+      code: 'import hunch\nworld  = hunch.example("kuhn")\nsolved = world.train()\nenv    = world.env(agents=["alice"], policy=solved)\nprint(world.grade({"alice": lambda obs, legal: "bet"}, against=solved))'
     }
   };
 
@@ -304,8 +429,8 @@ $ ./bin/hunch studio</pre>
   const desc = document.getElementById('desc');
   const code = document.getElementById('code');
 
-  const LABEL = { home: 'Home', docs: 'Documentation', studio: 'Studio' };
-  const ORDER = { home: 0, docs: 1, studio: 2 };
+  const LABEL = { home: 'Quickstart', docs: 'The language', python: 'From Python' };
+  const ORDER = { home: 0, docs: 1, python: 2 };
   const seen = new Set();
 
   // DOM order sets the tab order (Home, Docs, Studio); grid placement keeps the art intact
@@ -349,12 +474,14 @@ $ ./bin/hunch studio</pre>
       b.className = 'copy-btn';
       b.setAttribute('aria-label', 'Copy line');
       b.innerHTML = COPY_ICON;
+      // a command is copied without its prompt
+      const copied = line.replace(/^\$ /, '');
       b.addEventListener('click', async () => {
         try {
-          await navigator.clipboard.writeText(line);
+          await navigator.clipboard.writeText(copied);
         } catch {
           const t = document.createElement('textarea');
-          t.value = line;
+          t.value = copied;
           document.body.appendChild(t);
           t.select();
           document.execCommand('copy');
@@ -386,7 +513,6 @@ $ ./bin/hunch studio</pre>
     pinned = region;
     show(region);
     if (updateUrl) {
-      // mock routing; swap for /docs/ and /studio/ when those pages exist
       history.replaceState(null, '', region ? '#' + region : location.pathname);
     }
   }
