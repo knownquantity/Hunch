@@ -163,7 +163,7 @@ Strength grew with self-play and then levelled off. From the random openings on 
 
 | the world | method | what you are told |
 |---|---|---|
-| small enough to follow whole: up to two million positions | solved, by backward induction, a search over every outcome, or regret matching (CFR+), depending on what the agents are shown | exact values, and how much any agent could gain by changing its policy alone |
+| small enough to follow whole: up to two million positions | solved. Where no agent is kept from seeing something, by backward induction or a search over every outcome, which give the exact answer. Where agents hide things from each other, by regret matching (CFR+), which closes in on an equilibrium and stops within 0.001 of one | every number is computed over all outcomes, not sampled: what each agent collects, and how much any agent could still gain by changing its policy alone |
 | too big, and nothing is hidden from the agents | a search at each decision, guided by a network it trains by playing itself | sampled returns, and what the search weighed at each decision |
 | too big or real-valued chance, with something hidden | PPO for one agent, sampled regret matching for several | sampled returns with standard errors |
 
@@ -198,15 +198,21 @@ def always_bet(obs, legal):                         # any function, network or m
 print(world.grade({"alice": always_bet}, against=solved))
 ```
 
-`grade` is for evaluation. Because the game is solved, it can score any agent you bring, a PPO network, a script or a language model, by weighing every deal and every reply with nothing sampled. It reports what the agent collects, how much a best reply would take from it, and which decisions cost it most. In [`examples/ppo_sb3.py`](examples/ppo_sb3.py), PPO after 60,000 steps collects within 0.002 of the best possible against the solved opponent, and an opponent who knew its policy would take 0.27 a hand from it. The reward curve shows only the first number.
+`grade` is for evaluation. Because the game is solved, it can score any agent you bring, a PPO network, a script or a language model, by weighing every deal and every reply with nothing sampled. It reports what the agent collects, how much a best reply would take from it, and which decisions cost it most. In [`examples/ppo_sb3.py`](examples/ppo_sb3.py), PPO after 60,000 steps collects within 0.002 of the best possible against the solved opponent, and an opponent who knew its policy would take 0.27 a hand from it. The reward curve shows only the first number. Neither idea is new: [Timbers and others](https://arxiv.org/abs/2004.09677) showed that trained agents can be this exploitable, and [Regazzoni and others](https://neurips.cc/virtual/2026/loc/sydney/178174) scored language models this way on Kuhn poker. `grade` makes it one call on any small world you write. A language model is graded on the one answer it gives in each situation; to grade the mix it really plays, have it answer with probabilities, or ask several times and average.
 
 [Hunch from Python](docs/python.md) has the full interface and the grading of a language model.
 
 ## Writing a world
 
-The whole language is one page: [`llms.txt`](llms.txt). It is written to be pasted into a model's context, and a model that has read it can write a new world in about thirty lines. The language has no modules, no strings and no recursion, on purpose: a world that fits on a page is one a person or a model can get right.
+The whole language is one page: [`llms.txt`](llms.txt). It is written to be pasted into a model's context. In one test, a model given only that page wrote Nim and a hidden-mine game that trained correctly, the first on its first try and the second on its second; that is one test, not a rate. The language has no modules, no strings and no recursion, on purpose: a world that fits on a page is one a person or a model can get right.
+
+## Next to other tools
+
+No algorithm here is new, and [OpenSpiel](https://github.com/google-deepmind/open_spiel) has all of them and more. There, a game is a class written against an API (Kuhn poker is 227 lines of Python) and you choose and script the algorithm. Here, Kuhn poker is the 78 lines above and `train` chooses. Use OpenSpiel for its hundred games, exact equilibria, more than two players and GPU training; use Hunch when the game is your own, small, and you want the answer today. [Hunch next to other tools](docs/compare.md) covers Gambit, Rulebook, Ludii, Pgx and the published work this builds on.
 
 ## Limits
+
+- This is a tool for small games and for learning what a policy does. Two million positions holds Leduc poker and one-die liar's dice, not the games poker or chess research is about.
 
 - Exact answers stop at about two million positions. Past that, or with `rand()`, results are sampled and say so.
 - The search reads the whole state, so `train` picks it only when sampling finds nothing hidden, which is evidence and not proof. Its self-play takes ten minutes by default and gets what it can in that time: a machine with fewer cores plays fewer games and ends weaker. It has been measured on two-player board games only.
